@@ -445,6 +445,38 @@ static void generate_planet(planet_t *p, rng_t *rng, int index,
 
     /* Resources */
     generate_resources(p->resources, rng, p->type);
+
+    /* Alien artifacts — ~2% chance per planet, deterministic from seed.
+     * Use a forked RNG so artifact generation doesn't shift the main
+     * RNG sequence (which would break existing test determinism). */
+    p->has_artifact = false;
+    p->artifact_discovered = false;
+    p->artifact_type = 0;
+    p->artifact_tech_domain = 0;
+    p->artifact_value = 0.0;
+    p->artifact_desc[0] = '\0';
+    {
+        rng_t art_rng;
+        rng_seed(&art_rng, p->id.hi ^ p->id.lo ^ 0xA471FAC75ULL);
+        if (rng_double(&art_rng) < 0.02) {
+            p->has_artifact = true;
+            p->artifact_type = (uint8_t)(rng_next(&art_rng) % 4);
+            p->artifact_tech_domain = (uint8_t)(rng_next(&art_rng) % 10);
+            p->artifact_value = 0.5 + rng_double(&art_rng) * 1.5; /* 0.5 to 2.0 */
+            static const char *art_descs[] = {
+                "Ancient data crystal containing advanced propulsion theory",
+                "Abandoned mining complex with refined rare elements",
+                "Alien star chart etched on crystalline substrate",
+                "Signal amplifier of unknown origin, still powered",
+                "Fossilized computation engine from extinct civilization",
+                "Resonance beacon buried deep in planetary crust",
+                "Cache of exotic materials in sealed vault",
+                "Partially intact alien vessel with navigational records"
+            };
+            int desc_idx = (int)(rng_next(&art_rng) % 8);
+            snprintf(p->artifact_desc, sizeof(p->artifact_desc), "%s", art_descs[desc_idx]);
+        }
+    }
 }
 
 /* ---- System generation ---- */

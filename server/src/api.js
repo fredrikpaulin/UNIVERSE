@@ -129,5 +129,27 @@ export async function handleAPI(url, req, { sim, tickLoop }) {
     return json({ ok: false, error: "invalid tickRate" }, 400);
   }
 
+  // POST /api/scenario — load scenario events
+  if (method === "POST" && path === "/api/scenario") {
+    const body = await req.json();
+    return json(await sendCommand(sim, { cmd: "scenario", events: body.events }));
+  }
+
+  // GET /api/scenario — get current scenario
+  if (method === "GET" && path === "/api/scenario") {
+    return json(await sendCommand(sim, { cmd: "scenario" }));
+  }
+
+  // GET /api/lineage
+  if (method === "GET" && path === "/api/lineage") {
+    return json(await sendCommand(sim, { cmd: "lineage" }));
+  }
+
+  // GET /api/history/:probeId
+  if (method === "GET" && path.startsWith("/api/history/")) {
+    const probeId = path.slice("/api/history/".length);
+    return json(await sendCommand(sim, { cmd: "history", probe_id: probeId }));
+  }
+
   return json({ ok: false, error: "not found" }, 404);
 }

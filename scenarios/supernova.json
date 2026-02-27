@@ -1,0 +1,10 @@
+{
+  "name": "Nearby Supernova",
+  "description": "A supernova detonates near the probe's system, causing escalating radiation hazards.",
+  "events": [
+    { "at_tick": 10, "type": 2, "subtype": 2, "severity": 0.3 },
+    { "at_tick": 15, "type": 2, "subtype": 2, "severity": 0.6 },
+    { "at_tick": 20, "type": 2, "subtype": 2, "severity": 0.9 },
+    { "at_tick": 25, "type": 3, "subtype": 0, "severity": 0.5 }
+  ]
+}

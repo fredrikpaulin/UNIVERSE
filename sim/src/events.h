@@ -137,6 +137,19 @@ typedef struct {
     probe_uid_t     discovered_by;
 } civilization_t;
 
+/* ---- Pending hazards (warn before strike) ---- */
+
+#define MAX_PENDING_HAZARDS 32
+
+typedef struct {
+    int          subtype;       /* HAZ_SOLAR_FLARE etc. */
+    float        severity;
+    uint64_t     warn_tick;
+    uint64_t     strike_tick;
+    probe_uid_t  target;
+    bool         struck;
+} pending_hazard_t;
+
 /* ---- Event log ---- */
 
 typedef struct {
@@ -146,6 +159,8 @@ typedef struct {
     int            anomaly_count;
     civilization_t civilizations[MAX_CIVILIZATIONS];
     int            civ_count;
+    pending_hazard_t pending_hazards[MAX_PENDING_HAZARDS];
+    int              pending_count;
 } event_system_t;
 
 /* ---- API ---- */
@@ -202,6 +217,19 @@ int events_get_anomalies(const event_system_t *es, probe_uid_t system_id,
 /* Get civilization on a planet, or NULL if none. */
 const civilization_t *events_get_civ(const event_system_t *es,
                                      probe_uid_t planet_id);
+
+/* Queue a hazard warning (strike after delay). Returns 0 on success. */
+int events_queue_hazard(event_system_t *es, probe_uid_t target,
+                        int subtype, float severity,
+                        uint64_t warn_tick, uint64_t strike_tick);
+
+/* Strike pending hazards whose time has come. Returns count struck. */
+int events_strike_pending(event_system_t *es, probe_t *probes,
+                          int probe_count, uint64_t current_tick);
+
+/* Get pending (not yet struck) hazards for a probe. Returns count. */
+int events_get_threats(const event_system_t *es, probe_uid_t probe_id,
+                       pending_hazard_t *out, int max_out);
 
 /* Check if event type is deterministic for seed (replay test). */
 bool events_deterministic_check(uint64_t seed, int tick_count,

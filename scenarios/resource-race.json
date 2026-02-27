@@ -1,0 +1,10 @@
+{
+  "name": "Resource Race",
+  "description": "Rich mineral deposits discovered, followed by system-threatening hazards. Mine fast or flee.",
+  "events": [
+    { "at_tick": 3,  "type": 0, "subtype": 0, "severity": 0.9 },
+    { "at_tick": 5,  "type": 0, "subtype": 0, "severity": 0.8 },
+    { "at_tick": 40, "type": 2, "subtype": 1, "severity": 0.7 },
+    { "at_tick": 60, "type": 4, "subtype": 2, "severity": 1.0 }
+  ]
+}

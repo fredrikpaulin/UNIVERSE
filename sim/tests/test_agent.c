@@ -236,7 +236,9 @@ static void test_action_names(void) {
     const char *names[] = {
         "navigate_to_body", "enter_orbit", "land", "launch",
         "survey", "mine", "wait", "repair", "travel_to_system", "replicate",
-        "send_message", "place_beacon", "build_structure", "trade"
+        "send_message", "place_beacon", "build_structure", "trade",
+        "claim_system", "revoke_claim", "propose", "vote",
+        "research", "share_tech"
     };
     for (int i = 0; i < ACT_COUNT; i++) {
         action_type_t a = action_type_from_name(names[i]);

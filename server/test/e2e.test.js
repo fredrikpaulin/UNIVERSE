@@ -573,4 +573,145 @@ describe("end-to-end", () => {
     await new Promise((r) => setTimeout(r, 100));
     await post("/api/restore", { tag: "pre_trade" });
   });
+
+  test("observations include diplomacy fields (claims, proposals, trust)", async () => {
+    const resp = await post("/api/tick");
+    const obs = resp.observations[0];
+    expect(Array.isArray(obs.claims)).toBe(true);
+    expect(Array.isArray(obs.proposals)).toBe(true);
+    expect(Array.isArray(obs.trust)).toBe(true);
+  });
+
+  test("claim_system action creates a claim visible in observations", async () => {
+    await post("/api/snapshot", { tag: "pre_claim" });
+    const status = await get("/api/status");
+    const probeId = status.probes[0].id;
+
+    const { ws: agentWs } = await connectAgent(probeId, () => ({
+      action: "claim_system",
+    }));
+
+    await post("/api/tick");
+    await new Promise((r) => setTimeout(r, 200));
+
+    const resp = await post("/api/tick");
+    const obs = resp.observations.find((o) => o.probe_id === probeId);
+    expect(obs.claims.length).toBeGreaterThan(0);
+    expect(obs.claims[0].claimer).toBe(probeId);
+
+    agentWs.close();
+    await new Promise((r) => setTimeout(r, 100));
+    await post("/api/restore", { tag: "pre_claim" });
+  });
+
+  test("propose action creates an active proposal", async () => {
+    await post("/api/snapshot", { tag: "pre_propose" });
+    const status = await get("/api/status");
+    const probeId = status.probes[0].id;
+
+    const { ws: agentWs } = await connectAgent(probeId, () => ({
+      action: "propose",
+      text: "Survey all planets",
+    }));
+
+    await post("/api/tick");
+    await new Promise((r) => setTimeout(r, 200));
+
+    const resp = await post("/api/tick");
+    const obs = resp.observations.find((o) => o.probe_id === probeId);
+    expect(obs.proposals.length).toBeGreaterThan(0);
+    expect(obs.proposals[0].text).toBe("Survey all planets");
+    expect(obs.proposals[0].proposer).toBe(probeId);
+
+    agentWs.close();
+    await new Promise((r) => setTimeout(r, 100));
+    await post("/api/restore", { tag: "pre_propose" });
+  });
+
+  test("research action shows progress in observations", async () => {
+    await post("/api/snapshot", { tag: "pre_research" });
+    const status = await get("/api/status");
+    const probeId = status.probes[0].id;
+
+    const { ws: agentWs } = await connectAgent(probeId, () => ({
+      action: "research",
+      domain: 0,
+    }));
+
+    // Run a few ticks to accumulate research progress
+    await post("/api/tick");
+    await post("/api/tick");
+    await new Promise((r) => setTimeout(r, 200));
+
+    const resp = await post("/api/tick");
+    const obs = resp.observations.find((o) => o.probe_id === probeId);
+    expect(obs.research).toBeDefined();
+    expect(obs.research.domain).toBe(0);
+    expect(obs.research.progress).toBeGreaterThan(0);
+    expect(obs.research.ticks_remaining).toBeGreaterThan(0);
+
+    agentWs.close();
+    await new Promise((r) => setTimeout(r, 100));
+    await post("/api/restore", { tag: "pre_research" });
+  });
+
+  test("planet observations do not show artifact before survey", async () => {
+    const resp = await post("/api/tick");
+    const obs = resp.observations[0];
+    if (obs.system && obs.system.planets) {
+      for (const pl of obs.system.planets) {
+        expect(pl.artifact).toBeUndefined();
+      }
+    }
+  });
+
+  test("observations include threats array for hazard warnings", async () => {
+    const resp = await post("/api/tick");
+    const obs = resp.observations[0];
+    expect(Array.isArray(obs.threats)).toBe(true);
+    for (const t of obs.threats) {
+      expect(t).toHaveProperty("type");
+      expect(t).toHaveProperty("severity");
+      expect(t).toHaveProperty("ticks_until");
+    }
+  });
+
+  test("observations include relay_network array", async () => {
+    const resp = await post("/api/tick");
+    const obs = resp.observations[0];
+    expect(Array.isArray(obs.relay_network)).toBe(true);
+  });
+
+  test("GET /api/lineage returns entries array", async () => {
+    const resp = await get("/api/lineage");
+    expect(resp.ok).toBe(true);
+    expect(Array.isArray(resp.entries)).toBe(true);
+  });
+
+  test("GET /api/history/:probeId returns events array", async () => {
+    const status = await get("/api/status");
+    const probeId = status.probes[0].id;
+    const resp = await get(`/api/history/${probeId}`);
+    expect(resp.ok).toBe(true);
+    expect(resp.probe_id).toBe(probeId);
+    expect(Array.isArray(resp.events)).toBe(true);
+  });
+
+  test("POST /api/scenario loads events, GET returns them", async () => {
+    const loadResp = await post("/api/scenario", {
+      events: [
+        { at_tick: 100, type: 2, subtype: 0, severity: 0.5 },
+        { at_tick: 200, type: 4, subtype: 1, severity: 0.9 },
+      ],
+    });
+    expect(loadResp.ok).toBe(true);
+    expect(loadResp.loaded).toBe(2);
+
+    const getResp = await get("/api/scenario");
+    expect(getResp.ok).toBe(true);
+    expect(Array.isArray(getResp.events)).toBe(true);
+    expect(getResp.events.length).toBe(2);
+    expect(getResp.events[0].at_tick).toBe(100);
+    expect(getResp.events[1].at_tick).toBe(200);
+  });
 });

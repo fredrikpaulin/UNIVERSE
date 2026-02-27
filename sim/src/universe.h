@@ -131,6 +131,13 @@ typedef struct {
     uint64_t     discovery_tick;
     uint8_t      moon_count;
     /* moons stored separately to keep struct flat */
+    /* Alien artifacts (Phase 10) */
+    bool         has_artifact;
+    uint8_t      artifact_type;      /* 0=tech_boost, 1=resource_cache, 2=star_map, 3=comm_amplifier */
+    uint8_t      artifact_tech_domain; /* for tech_boost: tech_domain_t */
+    double       artifact_value;     /* bonus magnitude */
+    char         artifact_desc[128];
+    bool         artifact_discovered;
 } planet_t;
 
 typedef struct {

@@ -25,6 +25,12 @@ typedef enum {
     ACT_PLACE_BEACON,       /* Place a beacon in current system */
     ACT_BUILD_STRUCTURE,    /* Start building a structure */
     ACT_TRADE,              /* Send resources to another probe */
+    ACT_CLAIM_SYSTEM,       /* Claim current system as territory */
+    ACT_REVOKE_CLAIM,       /* Revoke own claim on current system */
+    ACT_PROPOSE,            /* Submit a proposal for voting */
+    ACT_VOTE,               /* Vote on an active proposal */
+    ACT_RESEARCH,           /* Research a tech domain */
+    ACT_SHARE_TECH,         /* Share tech with another probe */
     ACT_COUNT
 } action_type_t;
 
@@ -40,7 +46,10 @@ typedef struct {
     int            survey_level;     /* 0-4 for survey */
     double         amount;           /* For trade */
     int            structure_type;   /* For build_structure (structure_type_t) */
-    char           message[256];     /* For send_message, place_beacon */
+    char           message[256];     /* For send_message, place_beacon, propose */
+    int            proposal_idx;    /* For vote */
+    bool           vote_favor;      /* For vote */
+    int            research_domain; /* For research, share_tech (tech_domain_t) */
 } action_t;
 
 /* ---- Action result ---- */

@@ -22,7 +22,9 @@ static const char *RESOURCE_NAMES[RES_COUNT] = {
 static const char *ACTION_NAMES[ACT_COUNT] = {
     "navigate_to_body", "enter_orbit", "land", "launch",
     "survey", "mine", "wait", "repair", "travel_to_system", "replicate",
-    "send_message", "place_beacon", "build_structure", "trade"
+    "send_message", "place_beacon", "build_structure", "trade",
+    "claim_system", "revoke_claim", "propose", "vote",
+    "research", "share_tech"
 };
 
 static const char *LOCATION_NAMES[] = {
@@ -276,6 +278,51 @@ int action_parse(const char *json, action_t *out) {
         if (json_find_int(json, "amount", &amt) == 0) {
             out->amount = (double)amt;
         }
+    }
+
+    /* claim_system and revoke_claim need no extra fields (use probe's current system) */
+
+    if (type == ACT_PROPOSE) {
+        json_find_str(json, "text", out->message, sizeof(out->message));
+    }
+
+    if (type == ACT_VOTE) {
+        long long idx = 0;
+        json_find_int(json, "proposal", &idx);
+        out->proposal_idx = (int)idx;
+        /* Parse "favor":true/false — check for "true" string in value */
+        char favor_str[16] = {0};
+        if (json_find_str(json, "favor", favor_str, sizeof(favor_str))) {
+            out->vote_favor = (strcmp(favor_str, "true") == 0);
+        } else {
+            /* Try as bool — look for favor":true */
+            const char *fpos = strstr(json, "\"favor\":");
+            if (fpos) {
+                fpos += 8;
+                while (*fpos == ' ') fpos++;
+                out->vote_favor = (*fpos == 't');
+            }
+        }
+    }
+
+    if (type == ACT_RESEARCH) {
+        long long dom = 0;
+        json_find_int(json, "domain", &dom);
+        out->research_domain = (int)dom;
+    }
+
+    if (type == ACT_SHARE_TECH) {
+        char tgt_str[64] = {0};
+        if (json_find_str(json, "target", tgt_str, sizeof(tgt_str))) {
+            uint64_t hi = 0, lo = 0;
+            hi = strtoull(tgt_str, NULL, 10);
+            const char *dash = strchr(tgt_str, '-');
+            if (dash) lo = strtoull(dash + 1, NULL, 10);
+            out->target_probe = (probe_uid_t){hi, lo};
+        }
+        long long dom = 0;
+        json_find_int(json, "domain", &dom);
+        out->research_domain = (int)dom;
     }
 
     return 0;

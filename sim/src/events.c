@@ -513,3 +513,71 @@ bool events_deterministic_check(uint64_t seed, int tick_count,
 
     return true;
 }
+
+/* ---- Pending hazard queue ---- */
+
+int events_queue_hazard(event_system_t *es, probe_uid_t target,
+                        int subtype, float severity,
+                        uint64_t warn_tick, uint64_t strike_tick) {
+    if (es->pending_count >= MAX_PENDING_HAZARDS) return -1;
+    pending_hazard_t *h = &es->pending_hazards[es->pending_count++];
+    h->subtype = subtype;
+    h->severity = severity;
+    h->warn_tick = warn_tick;
+    h->strike_tick = strike_tick;
+    h->target = target;
+    h->struck = false;
+    return 0;
+}
+
+int events_strike_pending(event_system_t *es, probe_t *probes,
+                          int probe_count, uint64_t current_tick) {
+    int struck = 0;
+    for (int i = 0; i < es->pending_count; i++) {
+        pending_hazard_t *h = &es->pending_hazards[i];
+        if (h->struck) continue;
+        if (current_tick < h->strike_tick) continue;
+        h->struck = true;
+        struck++;
+        /* Find target probe and apply damage */
+        for (int j = 0; j < probe_count; j++) {
+            if (!uid_eq(probes[j].id, h->target)) continue;
+            if (probes[j].status == STATUS_DESTROYED) break;
+            switch (h->subtype) {
+            case HAZ_SOLAR_FLARE:
+                hazard_solar_flare(&probes[j], h->severity);
+                break;
+            case HAZ_ASTEROID_COLLISION:
+                hazard_asteroid(&probes[j], h->severity);
+                break;
+            case HAZ_RADIATION_BURST:
+                hazard_radiation(&probes[j], h->severity);
+                break;
+            default: break;
+            }
+            break;
+        }
+    }
+    /* Compact: remove struck entries */
+    int w = 0;
+    for (int i = 0; i < es->pending_count; i++) {
+        if (!es->pending_hazards[i].struck) {
+            if (w != i) es->pending_hazards[w] = es->pending_hazards[i];
+            w++;
+        }
+    }
+    es->pending_count = w;
+    return struck;
+}
+
+int events_get_threats(const event_system_t *es, probe_uid_t probe_id,
+                       pending_hazard_t *out, int max_out) {
+    int count = 0;
+    for (int i = 0; i < es->pending_count && count < max_out; i++) {
+        if (!es->pending_hazards[i].struck
+            && uid_eq(es->pending_hazards[i].target, probe_id)) {
+            out[count++] = es->pending_hazards[i];
+        }
+    }
+    return count;
+}

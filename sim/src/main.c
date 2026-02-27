@@ -132,6 +132,27 @@ static lineage_tree_t    g_pipe_lineage;
 static comm_system_t     g_pipe_comm;
 static society_t         g_pipe_society;
 
+typedef struct {
+    bool     active;
+    int      domain;
+    uint32_t ticks_elapsed;
+    uint32_t ticks_total;
+} research_state_t;
+static research_state_t  g_pipe_research[MAX_PROBES];
+
+/* Scenario scripting: scheduled event injections */
+#define MAX_SCENARIO_EVENTS 64
+typedef struct {
+    uint64_t     at_tick;
+    event_type_t type;
+    int          subtype;
+    float        severity;
+    probe_uid_t  target;
+    bool         fired;
+} scenario_event_t;
+static scenario_event_t g_pipe_scenario[MAX_SCENARIO_EVENTS];
+static int              g_pipe_scenario_count;
+
 static const char *PIPE_STATUS_NAMES[] = {
     "active","traveling","mining","building",
     "replicating","dormant","damaged","destroyed"
@@ -299,6 +320,7 @@ static int run_pipe_mode(uint64_t seed) {
     memset(&g_pipe_lineage, 0, sizeof(g_pipe_lineage));
     comm_init(&g_pipe_comm);
     society_init(&g_pipe_society);
+    memset(g_pipe_research, 0, sizeof(g_pipe_research));
 
     /* Init Bob */
     probe_init_bob(&uni.probes[0]);
@@ -441,9 +463,114 @@ static int run_pipe_mode(uint64_t seed) {
                     continue;
                 }
 
+                /* Handle claim_system action */
+                if (actions[i].type == ACT_CLAIM_SYSTEM) {
+                    probe_t *pr = &uni.probes[i];
+                    society_claim_system(&g_pipe_society, pr->id,
+                                         pr->system_id, uni.tick);
+                    continue;
+                }
+
+                /* Handle revoke_claim action */
+                if (actions[i].type == ACT_REVOKE_CLAIM) {
+                    probe_t *pr = &uni.probes[i];
+                    society_revoke_claim(&g_pipe_society, pr->id,
+                                          pr->system_id);
+                    continue;
+                }
+
+                /* Handle propose action */
+                if (actions[i].type == ACT_PROPOSE) {
+                    probe_t *pr = &uni.probes[i];
+                    society_propose(&g_pipe_society, pr->id,
+                                    actions[i].message, uni.tick,
+                                    uni.tick + 100);
+                    continue;
+                }
+
+                /* Handle vote action */
+                if (actions[i].type == ACT_VOTE) {
+                    probe_t *pr = &uni.probes[i];
+                    society_vote(&g_pipe_society, actions[i].proposal_idx,
+                                 pr->id, actions[i].vote_favor, uni.tick);
+                    continue;
+                }
+
+                /* Handle research action */
+                if (actions[i].type == ACT_RESEARCH) {
+                    probe_t *pr = &uni.probes[i];
+                    int dom = actions[i].research_domain;
+                    if (dom >= 0 && dom < TECH_COUNT) {
+                        if (!g_pipe_research[i].active) {
+                            g_pipe_research[i].active = true;
+                            g_pipe_research[i].domain = dom;
+                            g_pipe_research[i].ticks_elapsed = 0;
+                            g_pipe_research[i].ticks_total =
+                                50 * (1 + pr->tech_levels[dom]);
+                        }
+                    }
+                    continue;
+                }
+
+                /* Handle share_tech action */
+                if (actions[i].type == ACT_SHARE_TECH) {
+                    probe_t *pr = &uni.probes[i];
+                    int tidx = find_probe_idx(&uni, actions[i].target_probe);
+                    int dom = actions[i].research_domain;
+                    if (tidx >= 0 && dom >= 0 && dom < TECH_COUNT) {
+                        society_share_tech(pr, &uni.probes[tidx],
+                                           (tech_domain_t)dom);
+                        society_update_trust(pr, &uni.probes[tidx],
+                                             TRUST_TECH_SHARE);
+                    }
+                    continue;
+                }
+
                 system_t *sys = sys_cache_get(uni.probes[i].system_id,
                                               seed, uni.probes[i].sector);
                 if (sys) probe_execute_action(&uni.probes[i], &actions[i], sys);
+
+                /* Artifact discovery: survey level 4 on a planet with artifact */
+                if (actions[i].type == ACT_SURVEY && sys) {
+                    probe_t *pr = &uni.probes[i];
+                    for (int pi2 = 0; pi2 < sys->planet_count; pi2++) {
+                        planet_t *pl = &sys->planets[pi2];
+                        if (uid_eq(pr->body_id, pl->id)
+                            && pl->has_artifact && !pl->artifact_discovered
+                            && pl->surveyed[4]) {
+                            pl->artifact_discovered = true;
+                            /* Apply artifact bonus */
+                            switch (pl->artifact_type) {
+                                case 0: /* tech_boost */
+                                    if (pl->artifact_tech_domain < TECH_COUNT)
+                                        pr->tech_levels[pl->artifact_tech_domain]++;
+                                    break;
+                                case 1: /* resource_cache */
+                                    pr->resources[RES_IRON] += pl->artifact_value * 10.0;
+                                    pr->resources[RES_WATER] += pl->artifact_value * 5.0;
+                                    break;
+                                case 2: /* star_map — boost sensor range */
+                                    pr->sensor_range_ly += (float)(pl->artifact_value * 5.0);
+                                    break;
+                                case 3: /* comm_amplifier — boost sensor range */
+                                    pr->sensor_range_ly += (float)(pl->artifact_value * 3.0);
+                                    break;
+                            }
+                            /* Fire discovery event */
+                            if (g_pipe_events.count < MAX_EVENT_LOG) {
+                                sim_event_t *ev = &g_pipe_events.events[g_pipe_events.count++];
+                                ev->type = EVT_DISCOVERY;
+                                ev->subtype = DISC_IMPACT_CRATER; /* reuse closest subtype */
+                                ev->probe_id = pr->id;
+                                ev->system_id = pr->system_id;
+                                ev->tick = uni.tick;
+                                ev->severity = (float)pl->artifact_value;
+                                snprintf(ev->description, sizeof(ev->description),
+                                    "Artifact discovered: %s", pl->artifact_desc);
+                            }
+                        }
+                    }
+                }
             }
 
             /* Advance simulation */
@@ -489,13 +616,97 @@ static int run_pipe_mode(uint64_t seed) {
                                (int)uni.probe_count, uni.tick);
             society_build_tick(&g_pipe_society, uni.tick);
 
+            /* Auto-register completed relay satellites as comm relays */
+            for (int si = 0; si < g_pipe_society.structure_count; si++) {
+                structure_t *st = &g_pipe_society.structures[si];
+                if (st->type == STRUCT_RELAY_SATELLITE
+                    && st->complete && st->completed_tick == uni.tick) {
+                    int bidx = find_probe_idx(&uni, st->builder_ids[0]);
+                    if (bidx >= 0) {
+                        comm_build_relay(&g_pipe_comm, &uni.probes[bidx],
+                                         st->system_id, uni.tick);
+                    }
+                }
+            }
+
+            society_resolve_votes(&g_pipe_society, uni.tick);
+
+            /* Advance research */
+            for (uint32_t i = 0; i < uni.probe_count; i++) {
+                if (g_pipe_research[i].active) {
+                    g_pipe_research[i].ticks_elapsed++;
+                    if (g_pipe_research[i].ticks_elapsed
+                        >= g_pipe_research[i].ticks_total) {
+                        /* Research complete — advance tech */
+                        int d = g_pipe_research[i].domain;
+                        if (d >= 0 && d < TECH_COUNT
+                            && uni.probes[i].tech_levels[d] < 255) {
+                            uni.probes[i].tech_levels[d]++;
+                            /* Recalc derived stats */
+                            probe_t *pr = &uni.probes[i];
+                            pr->max_speed_c = 0.10f + 0.02f * pr->tech_levels[TECH_PROPULSION];
+                            pr->sensor_range_ly = 5.0f + 2.0f * pr->tech_levels[TECH_SENSORS];
+                            pr->mining_rate = 100.0f + 50.0f * pr->tech_levels[TECH_MINING];
+                            pr->construction_rate = 1.0f + 0.5f * pr->tech_levels[TECH_CONSTRUCTION];
+                            pr->compute_capacity = 100.0f + 50.0f * pr->tech_levels[TECH_COMPUTING];
+                        }
+                        memset(&g_pipe_research[i], 0,
+                               sizeof(g_pipe_research[i]));
+                    }
+                }
+            }
+
+            /* Trespass check — penalize trust for entering claimed systems */
+            for (uint32_t i = 0; i < uni.probe_count; i++) {
+                if (uni.probes[i].status == STATUS_DESTROYED) continue;
+                if (uni.probes[i].location_type == LOC_INTERSTELLAR) continue;
+                if (society_is_claimed_by_other(&g_pipe_society,
+                        uni.probes[i].system_id, uni.probes[i].id)) {
+                    probe_uid_t owner = society_get_claim(&g_pipe_society,
+                                            uni.probes[i].system_id);
+                    int oidx = find_probe_idx(&uni, owner);
+                    if (oidx >= 0) {
+                        society_update_trust(&uni.probes[oidx],
+                            &uni.probes[i], TRUST_CLAIM_VIOLATION);
+                    }
+                }
+            }
+
+            /* Strike pending hazards */
+            events_strike_pending(&g_pipe_events, uni.probes,
+                                  (int)uni.probe_count, uni.tick);
+
             /* Events */
             for (uint32_t i = 0; i < uni.probe_count; i++) {
                 if (uni.probes[i].status == STATUS_DESTROYED) continue;
                 system_t *sys = sys_cache_get(uni.probes[i].system_id,
                                               seed, uni.probes[i].sector);
-                if (sys) events_tick_probe(&g_pipe_events, &uni.probes[i],
-                                           sys, uni.tick, &rng);
+                if (sys) {
+                    int before = g_pipe_events.count;
+                    events_tick_probe(&g_pipe_events, &uni.probes[i],
+                                     sys, uni.tick, &rng);
+                    /* Queue warnings for any hazards generated */
+                    for (int e = before; e < g_pipe_events.count; e++) {
+                        if (g_pipe_events.events[e].type == EVT_HAZARD) {
+                            int delay = 3 + (int)(rng_next(&rng) % 3);
+                            events_queue_hazard(&g_pipe_events,
+                                uni.probes[i].id,
+                                g_pipe_events.events[e].subtype,
+                                g_pipe_events.events[e].severity,
+                                uni.tick, uni.tick + delay);
+                        }
+                    }
+                }
+            }
+
+            /* Fire scenario scheduled events */
+            for (int si = 0; si < g_pipe_scenario_count; si++) {
+                scenario_event_t *se = &g_pipe_scenario[si];
+                if (!se->fired && se->at_tick == uni.tick) {
+                    inject_event(&g_pipe_inject, se->type, se->subtype,
+                                 "", se->severity, se->target);
+                    se->fired = true;
+                }
             }
 
             /* Flush injected events */
@@ -698,7 +909,7 @@ static int run_pipe_mode(uint64_t seed) {
                             "\"rare_earth\":%.3f,\"water\":%.3f,"
                             "\"hydrogen\":%.3f,\"helium3\":%.3f,"
                             "\"carbon\":%.3f,\"uranium\":%.3f,"
-                            "\"exotic\":%.3f}}",
+                            "\"exotic\":%.3f}",
                             (double)planet->resources[RES_IRON],
                             (double)planet->resources[RES_SILICON],
                             (double)planet->resources[RES_RARE_EARTH],
@@ -708,6 +919,27 @@ static int run_pipe_mode(uint64_t seed) {
                             (double)planet->resources[RES_CARBON],
                             (double)planet->resources[RES_URANIUM],
                             (double)planet->resources[RES_EXOTIC]);
+                        /* Artifact data (only if discovered) */
+                        if (planet->has_artifact && planet->artifact_discovered) {
+                            static const char *art_type_names[] = {
+                                "tech_boost","resource_cache","star_map","comm_amplifier"};
+                            const char *atn = planet->artifact_type < 4
+                                ? art_type_names[planet->artifact_type] : "unknown";
+                            /* Escape artifact description */
+                            char adesc[256];
+                            int ai = 0;
+                            for (int ac = 0; planet->artifact_desc[ac] && ai < 250; ac++) {
+                                char ch = planet->artifact_desc[ac];
+                                if (ch == '"' || ch == '\\') adesc[ai++] = '\\';
+                                adesc[ai++] = ch;
+                            }
+                            adesc[ai] = '\0';
+                            p += snprintf(resp + p, REM,
+                                ",\"artifact\":{\"type\":\"%s\","
+                                "\"value\":%.3f,\"description\":\"%s\"}",
+                                atn, planet->artifact_value, adesc);
+                        }
+                        p += snprintf(resp + p, REM, "}");
                     }
                     p += snprintf(resp + p, REM, "]},");
                 } else {
@@ -854,7 +1086,142 @@ static int run_pipe_mode(uint64_t seed) {
                         tc++;
                     }
                 }
-                p += snprintf(resp + p, REM, "]}");
+                p += snprintf(resp + p, REM, "],");
+
+                /* Claims on probe's current system */
+                p += snprintf(resp + p, REM, "\"claims\":[");
+                {
+                    int cc = 0;
+                    for (int c = 0; c < g_pipe_society.claim_count; c++) {
+                        const claim_t *cl = &g_pipe_society.claims[c];
+                        if (!cl->active) continue;
+                        if (!uid_eq(cl->system_id, pr->system_id)) continue;
+                        if (cc > 0) resp[p++] = ',';
+                        p += snprintf(resp + p, REM,
+                            "{\"system_id\":\"%llu-%llu\","
+                            "\"claimer\":\"%llu-%llu\","
+                            "\"tick\":%llu}",
+                            (unsigned long long)cl->system_id.hi,
+                            (unsigned long long)cl->system_id.lo,
+                            (unsigned long long)cl->claimer_id.hi,
+                            (unsigned long long)cl->claimer_id.lo,
+                            (unsigned long long)cl->claimed_tick);
+                        cc++;
+                    }
+                }
+                p += snprintf(resp + p, REM, "],");
+
+                /* Active proposals */
+                p += snprintf(resp + p, REM, "\"proposals\":[");
+                {
+                    int pc = 0;
+                    for (int pi2 = 0; pi2 < g_pipe_society.proposal_count; pi2++) {
+                        const proposal_t *prop = &g_pipe_society.proposals[pi2];
+                        if (prop->status != VOTE_OPEN) continue;
+                        if (pc > 0) resp[p++] = ',';
+                        /* Escape proposal text */
+                        char safe_txt[MAX_PROPOSAL_TEXT + 64];
+                        int si = 0;
+                        for (int c = 0; prop->text[c] && si < (int)sizeof(safe_txt) - 2; c++) {
+                            char ch = prop->text[c];
+                            if (ch == '"' || ch == '\\') safe_txt[si++] = '\\';
+                            safe_txt[si++] = ch;
+                        }
+                        safe_txt[si] = '\0';
+                        p += snprintf(resp + p, REM,
+                            "{\"idx\":%d,"
+                            "\"proposer\":\"%llu-%llu\","
+                            "\"text\":\"%s\","
+                            "\"deadline\":%llu,"
+                            "\"for\":%d,\"against\":%d}",
+                            pi2,
+                            (unsigned long long)prop->proposer_id.hi,
+                            (unsigned long long)prop->proposer_id.lo,
+                            safe_txt,
+                            (unsigned long long)prop->deadline_tick,
+                            prop->votes_for, prop->votes_against);
+                        pc++;
+                    }
+                }
+                p += snprintf(resp + p, REM, "],");
+
+                /* Trust relationships */
+                p += snprintf(resp + p, REM, "\"trust\":[");
+                {
+                    int tc2 = 0;
+                    for (int r = 0; r < pr->relationship_count; r++) {
+                        if (tc2 > 0) resp[p++] = ',';
+                        p += snprintf(resp + p, REM,
+                            "{\"probe_id\":\"%llu-%llu\","
+                            "\"trust\":%.3f}",
+                            (unsigned long long)pr->relationships[r].other_id.hi,
+                            (unsigned long long)pr->relationships[r].other_id.lo,
+                            (double)pr->relationships[r].trust);
+                        tc2++;
+                    }
+                }
+                p += snprintf(resp + p, REM, "],");
+
+                /* Research progress (if active) */
+                if (g_pipe_research[i].active) {
+                    int trem = (int)g_pipe_research[i].ticks_total
+                             - (int)g_pipe_research[i].ticks_elapsed;
+                    if (trem < 0) trem = 0;
+                    double prog = g_pipe_research[i].ticks_total > 0
+                        ? (double)g_pipe_research[i].ticks_elapsed
+                          / g_pipe_research[i].ticks_total
+                        : 0.0;
+                    p += snprintf(resp + p, REM,
+                        "\"research\":{\"domain\":%d,"
+                        "\"progress\":%.3f,"
+                        "\"ticks_remaining\":%d},",
+                        g_pipe_research[i].domain, prog, trem);
+                }
+
+                /* Pending hazard threats */
+                p += snprintf(resp + p, REM, "\"threats\":[");
+                {
+                    pending_hazard_t tbuf[8];
+                    int tc3 = events_get_threats(&g_pipe_events, pr->id, tbuf, 8);
+                    for (int t = 0; t < tc3; t++) {
+                        if (t > 0) resp[p++] = ',';
+                        int ticks_until = (int)(tbuf[t].strike_tick - uni.tick);
+                        if (ticks_until < 0) ticks_until = 0;
+                        const char *haz_names[] = {"solar_flare","asteroid_collision","radiation_burst"};
+                        const char *hname = (tbuf[t].subtype >= 0 && tbuf[t].subtype < 3)
+                            ? haz_names[tbuf[t].subtype] : "unknown";
+                        p += snprintf(resp + p, REM,
+                            "{\"type\":\"%s\",\"severity\":%.3f,\"ticks_until\":%d}",
+                            hname, (double)tbuf[t].severity, ticks_until);
+                    }
+                }
+                p += snprintf(resp + p, REM, "],");
+
+                /* Relay network */
+                p += snprintf(resp + p, REM, "\"relay_network\":[");
+                {
+                    int rc2 = 0;
+                    for (int r = 0; r < g_pipe_comm.relay_count; r++) {
+                        relay_t *rl = &g_pipe_comm.relays[r];
+                        if (!rl->active) continue;
+                        if (rc2 > 0) resp[p++] = ',';
+                        p += snprintf(resp + p, REM,
+                            "{\"system_id\":\"%llu-%llu\","
+                            "\"owner\":\"%llu-%llu\","
+                            "\"range_ly\":%.1f}",
+                            (unsigned long long)rl->system_id.hi,
+                            (unsigned long long)rl->system_id.lo,
+                            (unsigned long long)rl->owner_id.hi,
+                            (unsigned long long)rl->owner_id.lo,
+                            rl->range_ly);
+                        rc2++;
+                    }
+                }
+                p += snprintf(resp + p, REM, "],");
+
+                /* Close probe object — remove trailing comma if needed */
+                if (p > 0 && resp[p-1] == ',') p--;
+                p += snprintf(resp + p, REM, "}");
             }
             p += snprintf(resp + p, REM, "]}");
             #undef REM
@@ -1050,8 +1417,9 @@ static int run_pipe_mode(uint64_t seed) {
             /* Re-seed RNG to match loaded tick */
             rng_seed(&rng, uni.seed);
             for (uint64_t t = 0; t < uni.tick; t++) rng_next(&rng);
-            /* Reset replication/comm/society state */
+            /* Reset replication/comm/society/research state */
             memset(g_pipe_repl, 0, sizeof(g_pipe_repl));
+            memset(g_pipe_research, 0, sizeof(g_pipe_research));
             comm_init(&g_pipe_comm);
             society_init(&g_pipe_society);
             fprintf(stdout,
@@ -1153,6 +1521,145 @@ static int run_pipe_mode(uint64_t seed) {
             }
             p += snprintf(resp + p, REM2, "]}");
             #undef REM2
+            fprintf(stdout, "%s\n", resp);
+            fflush(stdout);
+            continue;
+        }
+
+        /* ---- scenario ---- */
+        if (strcmp(cmd, "scenario") == 0) {
+            /* Parse if body contains "events" array (POST), otherwise GET */
+            const char *evts = strstr(line, "\"events\":");
+            if (evts) {
+                /* Load scenario events: [{"at_tick":N,"type":T,"subtype":S,"severity":F},..] */
+                g_pipe_scenario_count = 0;
+                const char *arr = strchr(evts, '[');
+                if (!arr) { pipe_err("invalid scenario events"); continue; }
+                const char *cursor = arr + 1;
+                while (*cursor && g_pipe_scenario_count < MAX_SCENARIO_EVENTS) {
+                    const char *obj = strchr(cursor, '{');
+                    if (!obj) break;
+                    scenario_event_t *se = &g_pipe_scenario[g_pipe_scenario_count];
+                    memset(se, 0, sizeof(*se));
+                    /* Parse at_tick */
+                    const char *at = strstr(obj, "\"at_tick\":");
+                    if (at) se->at_tick = (uint64_t)atoll(at + 10);
+                    /* Parse type */
+                    const char *tp = strstr(obj, "\"type\":");
+                    if (tp) se->type = (event_type_t)atoi(tp + 7);
+                    /* Parse subtype */
+                    const char *st = strstr(obj, "\"subtype\":");
+                    if (st) se->subtype = atoi(st + 10);
+                    /* Parse severity */
+                    const char *sv = strstr(obj, "\"severity\":");
+                    if (sv) se->severity = (float)atof(sv + 11);
+                    /* Parse probe target (optional) */
+                    const char *pr = strstr(obj, "\"probe\":\"");
+                    if (pr) {
+                        pr += 9;
+                        char pbuf[64] = {0};
+                        int pi2 = 0;
+                        while (*pr && *pr != '"' && pi2 < 63) pbuf[pi2++] = *pr++;
+                        pbuf[pi2] = '\0';
+                        se->target = parse_uid_str(pbuf);
+                    }
+                    se->fired = false;
+                    g_pipe_scenario_count++;
+                    cursor = strchr(obj, '}');
+                    if (!cursor) break;
+                    cursor++;
+                }
+                fprintf(stdout, "{\"ok\":true,\"loaded\":%d}\n",
+                        g_pipe_scenario_count);
+            } else {
+                /* GET: return current scenario */
+                int p = 0;
+                p += snprintf(resp + p, sizeof(resp) - (size_t)p,
+                    "{\"ok\":true,\"events\":[");
+                for (int si = 0; si < g_pipe_scenario_count; si++) {
+                    scenario_event_t *se = &g_pipe_scenario[si];
+                    if (si > 0) resp[p++] = ',';
+                    p += snprintf(resp + p, sizeof(resp) - (size_t)p,
+                        "{\"at_tick\":%llu,\"type\":%d,"
+                        "\"subtype\":%d,\"severity\":%.3f,"
+                        "\"fired\":%s}",
+                        (unsigned long long)se->at_tick,
+                        (int)se->type, se->subtype,
+                        (double)se->severity,
+                        se->fired ? "true" : "false");
+                }
+                p += snprintf(resp + p, sizeof(resp) - (size_t)p, "]}");
+                fprintf(stdout, "%s\n", resp);
+            }
+            fflush(stdout);
+            continue;
+        }
+
+        /* ---- lineage ---- */
+        if (strcmp(cmd, "lineage") == 0) {
+            int p = 0;
+            p += snprintf(resp + p, sizeof(resp) - (size_t)p,
+                "{\"ok\":true,\"entries\":[");
+            for (int li = 0; li < g_pipe_lineage.count; li++) {
+                lineage_entry_t *e = &g_pipe_lineage.entries[li];
+                if (li > 0) resp[p++] = ',';
+                p += snprintf(resp + p, sizeof(resp) - (size_t)p,
+                    "{\"parent\":\"%llu-%llu\","
+                    "\"child\":\"%llu-%llu\","
+                    "\"birth_tick\":%llu,"
+                    "\"generation\":%u}",
+                    (unsigned long long)e->parent_id.hi,
+                    (unsigned long long)e->parent_id.lo,
+                    (unsigned long long)e->child_id.hi,
+                    (unsigned long long)e->child_id.lo,
+                    (unsigned long long)e->birth_tick,
+                    e->generation);
+            }
+            p += snprintf(resp + p, sizeof(resp) - (size_t)p, "]}");
+            fprintf(stdout, "%s\n", resp);
+            fflush(stdout);
+            continue;
+        }
+
+        /* ---- history ---- */
+        if (strcmp(cmd, "history") == 0) {
+            /* Parse probe_id */
+            char pid_str[64] = {0};
+            const char *pp = strstr(line, "\"probe_id\":\"");
+            if (!pp) { pipe_err("missing probe_id"); continue; }
+            pp += 12;
+            int pi2 = 0;
+            while (*pp && *pp != '"' && pi2 < 63) pid_str[pi2++] = *pp++;
+            pid_str[pi2] = '\0';
+            probe_uid_t uid = parse_uid_str(pid_str);
+
+            int p = 0;
+            p += snprintf(resp + p, sizeof(resp) - (size_t)p,
+                "{\"ok\":true,\"probe_id\":\"%s\",\"events\":[", pid_str);
+            int ec = 0;
+            for (int ei = 0; ei < g_pipe_events.count; ei++) {
+                sim_event_t *ev = &g_pipe_events.events[ei];
+                if (!uid_eq(ev->probe_id, uid)) continue;
+                if (ec > 0) resp[p++] = ',';
+                /* Escape description */
+                char desc[512];
+                int di = 0;
+                for (int c = 0; ev->description[c] && di < 500; c++) {
+                    char ch = ev->description[c];
+                    if (ch == '"' || ch == '\\') desc[di++] = '\\';
+                    desc[di++] = ch;
+                }
+                desc[di] = '\0';
+                p += snprintf(resp + p, sizeof(resp) - (size_t)p,
+                    "{\"type\":%d,\"subtype\":%d,"
+                    "\"tick\":%llu,\"severity\":%.3f,"
+                    "\"description\":\"%s\"}",
+                    (int)ev->type, ev->subtype,
+                    (unsigned long long)ev->tick,
+                    (double)ev->severity, desc);
+                ec++;
+            }
+            p += snprintf(resp + p, sizeof(resp) - (size_t)p, "]}");
             fprintf(stdout, "%s\n", resp);
             fflush(stdout);
             continue;
