@@ -2,25 +2,25 @@
 
 ## Overview
 
-Project UNIVERSE can connect probes to large language models for decision-making. Instead of the simple fallback agent (repair if damaged, wait otherwise), a probe connected to an LLM gets rich contextual prompts about its situation and returns nuanced decisions with inner monologue.
+Project UNIVERSE can connect probes to large language models for decision-making. Instead of the simple fallback agent (repair if damaged, wait otherwise), a probe connected to an LLM gets contextual prompts about its situation and returns nuanced decisions with inner monologue.
 
-The architecture is split: the C simulation builds prompts and parses responses (`agent_llm.c`), while a Python bridge (`agents/agent_llm.py`) handles the actual API call to Anthropic's Claude.
+The agent (`agents/llm/agent.py`) connects to the Bun server via WebSocket, receives observations each tick, calls the Anthropic Claude API, parses the response into a game action, and sends it back. The C simulation handles prompt-building helpers and response parsing on the backend (`agent_llm.c`), but the Python agent is self-contained for the WebSocket flow.
 
 ## Setup
 
 ### 1. Python Environment
 
 ```bash
-# Install the Anthropic SDK (optional — the agent falls back to urllib)
-pip install anthropic
+# Only dependency: websockets
+pip install websockets
 
-# Or use without any dependencies (urllib fallback)
-python3 agents/agent_llm.py
+# Verify
+python3 -c "import websockets; print('ok')"
 ```
 
-### 2. API Key
+The agent uses `urllib` from stdlib for the Anthropic API call — no SDK needed.
 
-Set your Anthropic API key as an environment variable:
+### 2. API Key
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
@@ -28,45 +28,44 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 
 ### 3. Running
 
-Start the simulation first, then connect the Python agent:
+Start the server, then connect the agent:
 
 ```bash
-# Terminal 1: Start simulation
-LD_LIBRARY_PATH=. ./universe
+# Terminal 1: Start the universe server
+cd server && npx bun run src/index.js
 
-# Terminal 2: Connect LLM agent
-python3 agents/agent_llm.py
+# Terminal 2: Connect LLM agent (auto-discovers first probe)
+python3 agents/llm/agent.py --api-key $ANTHROPIC_API_KEY
+
+# Or specify a probe and server URL
+python3 agents/llm/agent.py --probe 1-1 --url ws://localhost:8000/ws
 ```
 
-The Python agent connects via Unix domain socket, receives JSON observations each tick, calls the Anthropic API, and returns JSON actions.
+### CLI Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--url` | `ws://localhost:8000/ws` | Server WebSocket URL |
+| `--probe` | auto-discover | Probe ID (`"1-1"` format) |
+| `--api-key` | `$ANTHROPIC_API_KEY` | Anthropic API key |
+| `--model` | `claude-sonnet-4-20250514` | Model to use |
+| `--deliberation-interval` | `10` | Call LLM every N ticks |
 
 ## How It Works
 
+### Connection Flow
+
+1. Agent fetches `GET /api/status` to discover probe IDs (unless `--probe` is given)
+2. Opens WebSocket to `/ws`
+3. Sends `{"type":"register","probe_id":"1-1"}`
+4. Receives `{"type":"registered","probe_id":"1-1"}`
+5. Enters tick loop: receive observation → decide → send action
+
 ### Prompt Construction
 
-Each deliberation cycle, the C side builds a multi-part prompt:
+On the first observation, the agent builds a system prompt from the probe's state (name, personality traits, quirks, earth memories). This prompt is reused for all subsequent LLM calls.
 
-**System prompt** (`llm_build_system_prompt`) — establishes the probe's identity:
-- Probe name and generation
-- Personality description (e.g., "You are deeply curious but cautious. You have a dry sense of humor.")
-- Active quirks
-- Earth memories (if any remain from parent generations)
-- Current goals
-- Expected JSON response format
-
-**Observation** (`llm_build_observation`) — current game state:
-- Current tick
-- Hull integrity, energy, fuel levels
-- Location (system name, nearby planets with survey status, or "deep space" if traveling)
-- Tech levels across all 10 domains
-- Recent events since last deliberation
-
-**Memory context** (`llm_build_memory_context`) — psychological state:
-- Top N most vivid episodic memories
-- Rolling summary of past events
-
-**Relationship context** (`llm_build_relationship_context`) — social awareness:
-- Known probes with trust levels and disposition
+The observation is sent as the user message, formatted as indented JSON with fields like hull, energy, fuel, location, status, tech levels.
 
 ### Response Format
 
@@ -74,116 +73,65 @@ The LLM responds with JSON:
 
 ```json
 {
-  "actions": [
-    {"type": "survey", "target_body": "planet_3", "survey_level": 2}
-  ],
-  "monologue": "This system has potential. The third planet's habitability readings are promising...",
-  "reasoning": "High habitability + unmined resources = good candidate for extended survey"
+  "action": "survey",
+  "monologue": "This system has potential. The third planet's readings are promising...",
+  "reasoning": "High habitability + unmined resources = good candidate"
 }
 ```
 
-`llm_parse_response()` extracts the actions (mapped to `action_t` enums) and the monologue. The hand-rolled JSON parser handles nested objects and arrays without any external library.
+The agent strips `monologue` and `reasoning`, then sends the action object to the server. It also handles the legacy format (`{"actions":[{"type":"survey"}]}`) for backwards compatibility.
 
-### Supported Action Types
+### Available Actions
 
-The LLM can request any standard probe action by name:
-
-| Action String | Enum | Description |
-|--------------|------|-------------|
-| `"survey"` | `ACT_SURVEY` | Survey a body (specify level 0-4) |
-| `"mine"` | `ACT_MINE` | Extract resources from landed body |
-| `"navigate"` | `ACT_NAVIGATE_TO_BODY` | Move to a body in current system |
-| `"orbit"` | `ACT_ENTER_ORBIT` | Enter orbit around a body |
-| `"land"` | `ACT_LAND` | Land on a body surface |
-| `"launch"` | `ACT_LAUNCH` | Launch from surface to orbit |
-| `"repair"` | `ACT_REPAIR` | Self-repair hull |
-| `"wait"` | `ACT_WAIT` | Do nothing this tick |
+| Action | Extra fields | Description |
+|--------|-------------|-------------|
+| `wait` | — | Do nothing |
+| `survey` | — | Scan current body (levels 0-4) |
+| `mine` | `resource` | Mine: iron, silicon, rare_earth, water, hydrogen, helium3, carbon, uranium, exotic |
+| `repair` | — | Self-repair hull |
+| `navigate_to_body` | `target_body_hi`, `target_body_lo` | Move to a body in current system |
+| `enter_orbit` | — | Enter orbit around current body |
+| `land` | — | Land on body surface |
+| `launch` | — | Launch from surface to orbit |
 
 ## Deliberation Throttling
 
-Calling an LLM every tick is expensive and usually unnecessary. The deliberation system controls call frequency:
+Calling an LLM every tick is expensive and usually unnecessary. The `--deliberation-interval` flag controls call frequency:
 
-- **Default interval:** Every 10 ticks (configurable)
-- **Force deliberation:** After significant events (hazard, discovery, arrival at new system), `llm_delib_force()` ensures the next tick triggers a full LLM call
-- **Between deliberations:** The probe repeats its last action or uses the fallback agent
+- **Default:** Every 10 ticks
+- **Between deliberations:** The agent sends `{"action":"wait"}` immediately (no API call)
+- **Tip:** Use 20-50 for routine exploration, lower for critical situations
 
-```c
-// Check if this tick needs LLM input
-if (llm_delib_should_call(&delib, current_tick)) {
-    // Build prompt, call LLM, parse response
-    llm_delib_record(&delib, current_tick);
-}
-```
+## C-Side Helpers
 
-## Cost Tracking
+The C simulation provides additional prompt-building and analysis functions in `agent_llm.c`:
 
-The cost tracker monitors API usage:
+- `llm_build_system_prompt()` — richer prompt with personality flavor text
+- `llm_build_observation()` — detailed game state including nearby planets
+- `llm_build_memory_context()` — vivid memories + rolling summary
+- `llm_build_relationship_context()` — known probes with trust levels
+- `llm_parse_response()` — hand-rolled JSON parser
+- `llm_cost_*()` — token cost tracking
+- `llm_delib_*()` — deliberation scheduling with force-on-event
+- `llm_log_*()` — decision audit trail
 
-```c
-llm_cost_tracker_t tracker;
-llm_cost_init(&tracker, 0.000003, 0.000015);  // input/output rates per token
-
-// After each call
-llm_cost_record(&tracker, input_tokens, output_tokens);
-
-// Check spend
-double avg = llm_cost_avg_per_call(&tracker);
-double total = tracker.total_cost_usd;
-```
-
-Default rates are set for Claude Haiku-class pricing. Adjust `cost_per_token_input` and `cost_per_token_output` for your model tier.
-
-## Context Management
-
-To keep prompts within token limits, the context manager maintains a rolling summary:
-
-```c
-llm_context_t ctx;
-llm_context_init(&ctx, 20);  // compress every 20 events
-
-// Each tick with events
-llm_context_append_event(&ctx, "Discovered mineral deposit on planet 3");
-llm_context_append_event(&ctx, "Solar flare caused 0.15 hull damage");
-
-// Auto-compresses: keeps the latter half of accumulated events
-const char *summary = llm_context_get_summary(&ctx);
-```
-
-Events accumulate as semicolon-separated text. When the count exceeds the compression interval, the summary is trimmed at a clean semicolon boundary, keeping recent events and discarding old ones.
-
-## Decision Logging
-
-Every LLM decision is logged for analysis:
-
-```c
-llm_decision_log_t log;
-llm_log_init(&log);
-
-llm_log_record(&log, tick, probe_id, &action, monologue,
-               input_tokens, output_tokens);
-
-// Query later
-llm_decision_log_entry_t entries[100];
-int n = llm_log_get_for_probe(&log, probe_id, entries, 100);
-```
-
-Each log entry captures: tick, probe ID, observation hash, chosen action, monologue text, and token counts.
+These are available when the simulation drives the prompts directly. The Python agent currently builds its own simpler prompts from the observation data. A future enhancement could have the server forward the C-built prompts to agents.
 
 ## Personality Integration
 
-The personality flavor text generator translates numeric traits into natural language for the system prompt:
+The system prompt translates observation fields into character traits:
 
-- Curiosity 0.8 → "deeply curious"
-- Caution -0.5 → "bold and reckless"
-- Humor 0.6 → "with a dry sense of humor"
-- Existential angst 0.9 → "often contemplating the nature of existence"
+- Curiosity > 0.5 → "deeply curious"
+- Caution > 0.5 → "cautious", < -0.3 → "bold"
+- Humor > 0.5 → "witty"
+- Empathy > 0.5 → "empathetic"
 
-This gives the LLM a character to inhabit rather than raw numbers. Combined with quirks and earth memories, each probe's prompts feel distinct even when facing similar situations.
+Combined with quirks and earth memories from the observation, each probe's prompts feel distinct even in similar situations.
 
-## Tips for Best Results
+## Tips
 
-**Use longer deliberation intervals for routine situations.** A probe surveying a system doesn't need LLM input every tick. Set the interval to 20-50 for exploration, and use `force_next` for critical moments.
+**Use longer deliberation intervals for routine situations.** A probe surveying a system doesn't need LLM input every tick. Set the interval to 20-50 for exploration.
 
-**Monitor token costs.** With 1,024 potential probes, LLM costs can add up. Consider running LLM agents only for "interesting" probes (first generation, probes encountering civilizations, etc.) and using the fallback agent for the rest.
+**Monitor token costs.** With many probes, LLM costs add up. Consider running LLM agents only for "interesting" probes and using the fallback (wait) for the rest.
 
-**The monologue is the payoff.** The most engaging part of LLM integration is reading what probes think. The monologue field captures inner thoughts that reflect personality drift, earth nostalgia, and relationships — this is what makes checking in on the simulation feel like reading a story.
+**The monologue is the payoff.** The most engaging part is reading what probes think. The monologue captures inner thoughts reflecting personality, nostalgia, and relationships — this is what makes checking in feel like reading a story.
