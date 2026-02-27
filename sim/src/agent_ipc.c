@@ -21,7 +21,8 @@ static const char *RESOURCE_NAMES[RES_COUNT] = {
 
 static const char *ACTION_NAMES[ACT_COUNT] = {
     "navigate_to_body", "enter_orbit", "land", "launch",
-    "survey", "mine", "wait", "repair"
+    "survey", "mine", "wait", "repair", "travel_to_system", "replicate",
+    "send_message", "place_beacon", "build_structure", "trade"
 };
 
 static const char *LOCATION_NAMES[] = {
@@ -214,6 +215,67 @@ int action_parse(const char *json, action_t *out) {
         json_find_int(json, "target_body_hi", &hi);
         json_find_int(json, "target_body_lo", &lo);
         out->target_body = (probe_uid_t){(uint64_t)hi, (uint64_t)lo};
+    }
+
+    if (type == ACT_TRAVEL_TO_SYSTEM) {
+        /* Parse target_system_id string "hi-lo" */
+        char sys_id_str[64] = {0};
+        if (json_find_str(json, "target_system_id", sys_id_str, sizeof(sys_id_str))) {
+            uint64_t hi = 0, lo = 0;
+            hi = strtoull(sys_id_str, NULL, 10);
+            const char *dash = strchr(sys_id_str, '-');
+            if (dash) lo = strtoull(dash + 1, NULL, 10);
+            out->target_system = (probe_uid_t){hi, lo};
+        }
+        /* Parse optional sector [x,y,z] */
+        long long sx = 0, sy = 0, sz = 0;
+        json_find_int(json, "sector_x", &sx);
+        json_find_int(json, "sector_y", &sy);
+        json_find_int(json, "sector_z", &sz);
+        out->target_sector = (sector_coord_t){(int)sx, (int)sy, (int)sz};
+    }
+
+    if (type == ACT_SEND_MESSAGE) {
+        /* Parse target probe "hi-lo" and message content */
+        char tgt_str[64] = {0};
+        if (json_find_str(json, "target", tgt_str, sizeof(tgt_str))) {
+            uint64_t hi = 0, lo = 0;
+            hi = strtoull(tgt_str, NULL, 10);
+            const char *dash = strchr(tgt_str, '-');
+            if (dash) lo = strtoull(dash + 1, NULL, 10);
+            out->target_probe = (probe_uid_t){hi, lo};
+        }
+        json_find_str(json, "content", out->message, sizeof(out->message));
+    }
+
+    if (type == ACT_PLACE_BEACON) {
+        json_find_str(json, "message", out->message, sizeof(out->message));
+    }
+
+    if (type == ACT_BUILD_STRUCTURE) {
+        long long stype = 0;
+        if (json_find_int(json, "structure_type", &stype) == 0) {
+            out->structure_type = (int)stype;
+        }
+    }
+
+    if (type == ACT_TRADE) {
+        char tgt_str[64] = {0};
+        if (json_find_str(json, "target", tgt_str, sizeof(tgt_str))) {
+            uint64_t hi = 0, lo = 0;
+            hi = strtoull(tgt_str, NULL, 10);
+            const char *dash = strchr(tgt_str, '-');
+            if (dash) lo = strtoull(dash + 1, NULL, 10);
+            out->target_probe = (probe_uid_t){hi, lo};
+        }
+        char res_name[64];
+        if (json_find_str(json, "resource", res_name, sizeof(res_name))) {
+            out->target_resource = resource_from_name(res_name);
+        }
+        long long amt = 0;
+        if (json_find_int(json, "amount", &amt) == 0) {
+            out->amount = (double)amt;
+        }
     }
 
     return 0;

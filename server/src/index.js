@@ -63,6 +63,11 @@ const server = Bun.serve({
       return new Response("WebSocket upgrade failed", { status: 400 });
     }
 
+    // Serve dashboard
+    if (url.pathname === "/" || url.pathname === "/index.html") {
+      return new Response(Bun.file(new URL("../public/index.html", import.meta.url)));
+    }
+
     return handleAPI(url, req, { sim, tickLoop });
   },
 

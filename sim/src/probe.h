@@ -19,16 +19,28 @@ typedef enum {
     ACT_MINE,               /* Extract a resource from the body we're landed on */
     ACT_WAIT,               /* Do nothing this tick */
     ACT_REPAIR,             /* Self-repair hull */
+    ACT_TRAVEL_TO_SYSTEM,   /* Initiate interstellar travel to another system */
+    ACT_REPLICATE,          /* Begin self-replication (requires resources) */
+    ACT_SEND_MESSAGE,       /* Send a message to another probe */
+    ACT_PLACE_BEACON,       /* Place a beacon in current system */
+    ACT_BUILD_STRUCTURE,    /* Start building a structure */
+    ACT_TRADE,              /* Send resources to another probe */
     ACT_COUNT
 } action_type_t;
 
 /* ---- Action input ---- */
 
 typedef struct {
-    action_type_t type;
-    probe_uid_t   target_body;      /* For navigate/orbit/land/survey */
-    resource_t    target_resource;  /* For mine */
-    int           survey_level;     /* 0-4 for survey */
+    action_type_t  type;
+    probe_uid_t    target_body;      /* For navigate/orbit/land/survey */
+    probe_uid_t    target_system;    /* For travel_to_system */
+    sector_coord_t target_sector;    /* For travel_to_system */
+    probe_uid_t    target_probe;     /* For send_message, trade */
+    resource_t     target_resource;  /* For mine, trade */
+    int            survey_level;     /* 0-4 for survey */
+    double         amount;           /* For trade */
+    int            structure_type;   /* For build_structure (structure_type_t) */
+    char           message[256];     /* For send_message, place_beacon */
 } action_t;
 
 /* ---- Action result ---- */

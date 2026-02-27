@@ -94,5 +94,40 @@ export async function handleAPI(url, req, { sim, tickLoop }) {
     return json({ ok: true, state: tickLoop.state });
   }
 
+  // POST /api/scan/:probeId — long-range sensor scan
+  if (method === "POST" && path.startsWith("/api/scan/")) {
+    const probeId = path.slice("/api/scan/".length);
+    return json(await sendCommand(sim, { cmd: "scan", probe_id: probeId }));
+  }
+
+  // POST /api/save
+  if (method === "POST" && path === "/api/save") {
+    const body = await req.json();
+    const savePath = body.path || "universe.db";
+    return json(await sendCommand(sim, { cmd: "save", path: savePath }));
+  }
+
+  // POST /api/load
+  if (method === "POST" && path === "/api/load") {
+    const body = await req.json();
+    const loadPath = body.path || "universe.db";
+    return json(await sendCommand(sim, { cmd: "load", path: loadPath }));
+  }
+
+  // GET /api/tick-rate
+  if (method === "GET" && path === "/api/tick-rate") {
+    return json({ ok: true, tickRate: tickLoop.tickRate });
+  }
+
+  // POST /api/tick-rate
+  if (method === "POST" && path === "/api/tick-rate") {
+    const body = await req.json();
+    if (typeof body.tickRate === "number" && body.tickRate > 0) {
+      tickLoop.tickRate = body.tickRate;
+      return json({ ok: true, tickRate: tickLoop.tickRate });
+    }
+    return json({ ok: false, error: "invalid tickRate" }, 400);
+  }
+
   return json({ ok: false, error: "not found" }, 404);
 }

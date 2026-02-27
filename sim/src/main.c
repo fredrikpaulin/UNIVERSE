@@ -26,6 +26,9 @@
 #include "render.h"
 #include "agent_ipc.h"
 #include "events.h"
+#include "replicate.h"
+#include "communicate.h"
+#include "society.h"
 #include "scenario.h"
 #include "util.h"
 
@@ -38,6 +41,7 @@
 #include <string.h>
 #include <signal.h>
 #include <time.h>
+#include <math.h>
 
 /* ---- Config ---- */
 
@@ -123,6 +127,10 @@ static config_t          g_pipe_cfg;
 static snapshot_t        g_pipe_snap[MAX_SNAP_SLOTS];
 static system_t          g_pipe_sys_cache[SYS_CACHE_MAX];
 static int               g_pipe_sys_count;
+static replication_state_t g_pipe_repl[MAX_PROBES];
+static lineage_tree_t    g_pipe_lineage;
+static comm_system_t     g_pipe_comm;
+static society_t         g_pipe_society;
 
 static const char *PIPE_STATUS_NAMES[] = {
     "active","traveling","mining","building",
@@ -287,6 +295,10 @@ static int run_pipe_mode(uint64_t seed) {
     config_init(&g_pipe_cfg);
     g_pipe_sys_count = 0;
     memset(g_pipe_snap, 0, sizeof(g_pipe_snap));
+    memset(g_pipe_repl, 0, sizeof(g_pipe_repl));
+    memset(&g_pipe_lineage, 0, sizeof(g_pipe_lineage));
+    comm_init(&g_pipe_comm);
+    society_init(&g_pipe_society);
 
     /* Init Bob */
     probe_init_bob(&uni.probes[0]);
@@ -337,6 +349,98 @@ static int run_pipe_mode(uint64_t seed) {
             /* Execute actions */
             for (uint32_t i = 0; i < uni.probe_count; i++) {
                 if (uni.probes[i].status == STATUS_DESTROYED) continue;
+
+                /* Handle travel_to_system specially — needs system lookup */
+                if (actions[i].type == ACT_TRAVEL_TO_SYSTEM) {
+                    probe_t *pr = &uni.probes[i];
+                    if (pr->status == STATUS_TRAVELING) continue;
+                    /* Find target system position from nearby sectors */
+                    system_t *target = sys_cache_get(
+                        actions[i].target_system, seed,
+                        actions[i].target_sector);
+                    if (!target) {
+                        /* Try generating the target sector */
+                        system_t tmp[30];
+                        int n = generate_sector(tmp, 30, seed,
+                                                actions[i].target_sector);
+                        for (int j = 0; j < n; j++) {
+                            if (uid_eq(tmp[j].id, actions[i].target_system)
+                                && g_pipe_sys_count < SYS_CACHE_MAX) {
+                                g_pipe_sys_cache[g_pipe_sys_count] = tmp[j];
+                                target = &g_pipe_sys_cache[g_pipe_sys_count++];
+                                break;
+                            }
+                        }
+                    }
+                    if (target) {
+                        travel_order_t order = {
+                            .target_pos = target->position,
+                            .target_system_id = target->id,
+                            .target_sector = target->sector
+                        };
+                        travel_initiate(pr, &order);
+                    }
+                    continue;
+                }
+
+                /* Handle replicate action */
+                if (actions[i].type == ACT_REPLICATE) {
+                    probe_t *pr = &uni.probes[i];
+                    if (pr->status != STATUS_ACTIVE) continue;
+                    if (repl_check_resources(pr) == 0) {
+                        repl_begin(pr, &g_pipe_repl[i]);
+                    }
+                    continue;
+                }
+
+                /* Handle send_message action */
+                if (actions[i].type == ACT_SEND_MESSAGE) {
+                    probe_t *pr = &uni.probes[i];
+                    /* Find target probe for position */
+                    int tidx = find_probe_idx(&uni, actions[i].target_probe);
+                    if (tidx >= 0) {
+                        comm_send_targeted(&g_pipe_comm, pr,
+                            actions[i].target_probe,
+                            uni.probes[tidx].heading,
+                            actions[i].message, uni.tick);
+                    }
+                    continue;
+                }
+
+                /* Handle place_beacon action */
+                if (actions[i].type == ACT_PLACE_BEACON) {
+                    probe_t *pr = &uni.probes[i];
+                    comm_place_beacon(&g_pipe_comm, pr, pr->system_id,
+                                      actions[i].message, uni.tick);
+                    continue;
+                }
+
+                /* Handle build_structure action */
+                if (actions[i].type == ACT_BUILD_STRUCTURE) {
+                    probe_t *pr = &uni.probes[i];
+                    int stype = actions[i].structure_type;
+                    if (stype >= 0 && stype < STRUCT_TYPE_COUNT) {
+                        society_build_start(&g_pipe_society, pr,
+                            (structure_type_t)stype, pr->system_id,
+                            uni.tick, &rng);
+                    }
+                    continue;
+                }
+
+                /* Handle trade action */
+                if (actions[i].type == ACT_TRADE) {
+                    probe_t *pr = &uni.probes[i];
+                    int tidx = find_probe_idx(&uni, actions[i].target_probe);
+                    if (tidx >= 0) {
+                        bool same_sys = uid_eq(pr->system_id,
+                                               uni.probes[tidx].system_id);
+                        society_trade_send(&g_pipe_society, pr,
+                            &uni.probes[tidx], actions[i].target_resource,
+                            actions[i].amount, same_sys, uni.tick);
+                    }
+                    continue;
+                }
+
                 system_t *sys = sys_cache_get(uni.probes[i].system_id,
                                               seed, uni.probes[i].sector);
                 if (sys) probe_execute_action(&uni.probes[i], &actions[i], sys);
@@ -350,8 +454,40 @@ static int run_pipe_mode(uint64_t seed) {
             for (uint32_t i = 0; i < uni.probe_count; i++) {
                 if (uni.probes[i].status == STATUS_TRAVELING)
                     travel_tick(&uni.probes[i], &rng);
+
+                /* Advance replication */
+                if (uni.probes[i].status == STATUS_REPLICATING
+                    && g_pipe_repl[i].active) {
+                    int rc = repl_tick(&uni.probes[i], &g_pipe_repl[i]);
+                    if (rc == 1) {
+                        /* Replication complete — create child */
+                        if (uni.probe_count < MAX_PROBES) {
+                            probe_t *child = &uni.probes[uni.probe_count];
+                            if (repl_finalize(&uni.probes[i], child,
+                                              &g_pipe_repl[i], &rng) == 0) {
+                                /* Place child in same system */
+                                child->system_id = uni.probes[i].system_id;
+                                child->sector = uni.probes[i].sector;
+                                child->heading = uni.probes[i].heading;
+                                child->location_type = uni.probes[i].location_type;
+                                lineage_record(&g_pipe_lineage,
+                                    uni.probes[i].id, child->id,
+                                    uni.tick, child->generation);
+                                uni.probe_count++;
+                            }
+                        }
+                        memset(&g_pipe_repl[i], 0, sizeof(g_pipe_repl[i]));
+                    }
+                }
+
                 probe_tick_energy(&uni.probes[i]);
             }
+
+            /* Deliver messages and trades */
+            comm_tick_deliver(&g_pipe_comm, uni.tick);
+            society_trade_tick(&g_pipe_society, uni.probes,
+                               (int)uni.probe_count, uni.tick);
+            society_build_tick(&g_pipe_society, uni.tick);
 
             /* Events */
             for (uint32_t i = 0; i < uni.probe_count; i++) {
@@ -376,14 +512,19 @@ static int run_pipe_mode(uint64_t seed) {
 
             /* Build observation response */
             int p = 0;
-            p += snprintf(resp + p, sizeof(resp) - (size_t)p,
+            size_t rem;
+            #define REM (rem = sizeof(resp) - (size_t)p, rem)
+
+            p += snprintf(resp + p, REM,
                 "{\"ok\":true,\"tick\":%llu,\"observations\":[",
                 (unsigned long long)uni.tick);
 
             for (uint32_t i = 0; i < uni.probe_count; i++) {
                 if (i > 0) resp[p++] = ',';
                 probe_t *pr = &uni.probes[i];
-                p += snprintf(resp + p, sizeof(resp) - (size_t)p,
+
+                /* Core fields */
+                p += snprintf(resp + p, REM,
                     "{\"probe_id\":\"%llu-%llu\","
                     "\"name\":\"%s\","
                     "\"status\":\"%s\","
@@ -392,7 +533,7 @@ static int run_pipe_mode(uint64_t seed) {
                     "\"fuel\":%.1f,"
                     "\"location\":\"%s\","
                     "\"generation\":%u,"
-                    "\"tech\":[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u]}",
+                    "\"tech\":[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u],",
                     (unsigned long long)pr->id.hi,
                     (unsigned long long)pr->id.lo,
                     pr->name,
@@ -406,8 +547,317 @@ static int run_pipe_mode(uint64_t seed) {
                     pr->tech_levels[4], pr->tech_levels[5],
                     pr->tech_levels[6], pr->tech_levels[7],
                     pr->tech_levels[8], pr->tech_levels[9]);
+
+                /* Resources */
+                p += snprintf(resp + p, REM,
+                    "\"resources\":{\"iron\":%.1f,\"silicon\":%.1f,"
+                    "\"rare_earth\":%.1f,\"water\":%.1f,\"hydrogen\":%.1f,"
+                    "\"helium3\":%.1f,\"carbon\":%.1f,\"uranium\":%.1f,"
+                    "\"exotic\":%.1f},",
+                    pr->resources[RES_IRON], pr->resources[RES_SILICON],
+                    pr->resources[RES_RARE_EARTH], pr->resources[RES_WATER],
+                    pr->resources[RES_HYDROGEN], pr->resources[RES_HELIUM3],
+                    pr->resources[RES_CARBON], pr->resources[RES_URANIUM],
+                    pr->resources[RES_EXOTIC]);
+
+                /* Position */
+                p += snprintf(resp + p, REM,
+                    "\"position\":{\"sector\":[%d,%d,%d],"
+                    "\"system_id\":\"%llu-%llu\","
+                    "\"body_id\":\"%llu-%llu\","
+                    "\"heading\":[%.3f,%.3f,%.3f],"
+                    "\"destination\":[%.3f,%.3f,%.3f],"
+                    "\"travel_remaining_ly\":%.3f},",
+                    pr->sector.x, pr->sector.y, pr->sector.z,
+                    (unsigned long long)pr->system_id.hi,
+                    (unsigned long long)pr->system_id.lo,
+                    (unsigned long long)pr->body_id.hi,
+                    (unsigned long long)pr->body_id.lo,
+                    pr->heading.x, pr->heading.y, pr->heading.z,
+                    pr->destination.x, pr->destination.y, pr->destination.z,
+                    pr->travel_remaining_ly);
+
+                /* Capabilities */
+                p += snprintf(resp + p, REM,
+                    "\"capabilities\":{\"max_speed_c\":%.4f,"
+                    "\"sensor_range_ly\":%.1f,\"mining_rate\":%.2f,"
+                    "\"construction_rate\":%.2f,\"compute_capacity\":%.1f},",
+                    (double)pr->max_speed_c,
+                    (double)pr->sensor_range_ly,
+                    (double)pr->mining_rate,
+                    (double)pr->construction_rate,
+                    (double)pr->compute_capacity);
+
+                /* Recent events (last 5 for this probe) */
+                p += snprintf(resp + p, REM, "\"recent_events\":[");
+                {
+                    sim_event_t evts[5];
+                    int ne = events_get_for_probe(&g_pipe_events, pr->id,
+                                                  evts, 5);
+                    for (int e = 0; e < ne; e++) {
+                        if (e > 0) resp[p++] = ',';
+                        /* Escape description for JSON safety */
+                        char safe_desc[256];
+                        int sd = 0;
+                        for (int c = 0; evts[e].description[c] && sd < 250; c++) {
+                            char ch = evts[e].description[c];
+                            if (ch == '"' || ch == '\\') safe_desc[sd++] = '\\';
+                            safe_desc[sd++] = ch;
+                        }
+                        safe_desc[sd] = '\0';
+                        p += snprintf(resp + p, REM,
+                            "{\"type\":%d,\"subtype\":%d,"
+                            "\"description\":\"%s\","
+                            "\"severity\":%.2f,\"tick\":%llu}",
+                            (int)evts[e].type, evts[e].subtype,
+                            safe_desc, (double)evts[e].severity,
+                            (unsigned long long)evts[e].tick);
+                    }
+                }
+                p += snprintf(resp + p, REM, "],");
+
+                /* Replication progress (if replicating) */
+                if (g_pipe_repl[i].active) {
+                    int trem = (int)g_pipe_repl[i].ticks_total
+                             - (int)g_pipe_repl[i].ticks_elapsed;
+                    if (trem < 0) trem = 0;
+                    p += snprintf(resp + p, REM,
+                        "\"replication\":{\"progress\":%.3f,"
+                        "\"ticks_remaining\":%d,"
+                        "\"consciousness_forked\":%s},",
+                        g_pipe_repl[i].progress, trem,
+                        g_pipe_repl[i].consciousness_forked ? "true" : "false");
+                }
+
+                /* System details (when not interstellar) */
+                system_t *sys = sys_cache_get(pr->system_id, seed, pr->sector);
+                if (sys && pr->location_type != LOC_INTERSTELLAR) {
+                    p += snprintf(resp + p, REM,
+                        "\"system\":{\"name\":\"%s\","
+                        "\"star_count\":%u,\"planet_count\":%u,",
+                        sys->name, sys->star_count, sys->planet_count);
+
+                    /* Stars */
+                    p += snprintf(resp + p, REM, "\"stars\":[");
+                    for (int s = 0; s < sys->star_count; s++) {
+                        if (s > 0) resp[p++] = ',';
+                        p += snprintf(resp + p, REM,
+                            "{\"name\":\"%s\",\"class\":%d,"
+                            "\"mass_solar\":%.3f,\"temp_k\":%.0f,"
+                            "\"luminosity_solar\":%.4f,"
+                            "\"metallicity\":%.2f}",
+                            sys->stars[s].name,
+                            (int)sys->stars[s].class,
+                            sys->stars[s].mass_solar,
+                            sys->stars[s].temperature_k,
+                            sys->stars[s].luminosity_solar,
+                            sys->stars[s].metallicity);
+                    }
+                    p += snprintf(resp + p, REM, "],");
+
+                    /* Planets — enhanced */
+                    p += snprintf(resp + p, REM, "\"planets\":[");
+                    for (int pl = 0; pl < sys->planet_count; pl++) {
+                        if (pl > 0) resp[p++] = ',';
+                        const planet_t *planet = &sys->planets[pl];
+                        p += snprintf(resp + p, REM,
+                            "{\"name\":\"%s\",\"type\":%d,"
+                            "\"mass_earth\":%.3f,"
+                            "\"radius_earth\":%.3f,"
+                            "\"orbital_radius_au\":%.3f,"
+                            "\"orbital_period_days\":%.1f,"
+                            "\"surface_temp_k\":%.1f,"
+                            "\"atmosphere_pressure_atm\":%.3f,"
+                            "\"water_coverage\":%.3f,"
+                            "\"habitability\":%.3f,"
+                            "\"magnetic_field\":%.3f,"
+                            "\"rings\":%s,"
+                            "\"moon_count\":%u,"
+                            "\"survey_complete\":[%s,%s,%s,%s,%s],",
+                            planet->name, (int)planet->type,
+                            planet->mass_earth,
+                            planet->radius_earth,
+                            planet->orbital_radius_au,
+                            planet->orbital_period_days,
+                            planet->surface_temp_k,
+                            planet->atmosphere_pressure_atm,
+                            planet->water_coverage,
+                            planet->habitability_index,
+                            planet->magnetic_field,
+                            planet->rings ? "true" : "false",
+                            planet->moon_count,
+                            planet->surveyed[0] ? "true" : "false",
+                            planet->surveyed[1] ? "true" : "false",
+                            planet->surveyed[2] ? "true" : "false",
+                            planet->surveyed[3] ? "true" : "false",
+                            planet->surveyed[4] ? "true" : "false");
+
+                        /* Planet resource abundances */
+                        p += snprintf(resp + p, REM,
+                            "\"resources\":{\"iron\":%.3f,\"silicon\":%.3f,"
+                            "\"rare_earth\":%.3f,\"water\":%.3f,"
+                            "\"hydrogen\":%.3f,\"helium3\":%.3f,"
+                            "\"carbon\":%.3f,\"uranium\":%.3f,"
+                            "\"exotic\":%.3f}}",
+                            (double)planet->resources[RES_IRON],
+                            (double)planet->resources[RES_SILICON],
+                            (double)planet->resources[RES_RARE_EARTH],
+                            (double)planet->resources[RES_WATER],
+                            (double)planet->resources[RES_HYDROGEN],
+                            (double)planet->resources[RES_HELIUM3],
+                            (double)planet->resources[RES_CARBON],
+                            (double)planet->resources[RES_URANIUM],
+                            (double)planet->resources[RES_EXOTIC]);
+                    }
+                    p += snprintf(resp + p, REM, "]},");
+                } else {
+                    /* Interstellar — no system details */
+                    p += snprintf(resp + p, REM, "\"system\":null,");
+                }
+
+                /* Nearby probes (within sensor range) */
+                p += snprintf(resp + p, REM, "\"nearby_probes\":[");
+                {
+                    int np_count = 0;
+                    for (uint32_t j = 0; j < uni.probe_count; j++) {
+                        if (j == i) continue;
+                        if (uni.probes[j].status == STATUS_DESTROYED) continue;
+                        double dx = pr->heading.x - uni.probes[j].heading.x;
+                        double dy = pr->heading.y - uni.probes[j].heading.y;
+                        double dz = pr->heading.z - uni.probes[j].heading.z;
+                        double dist = sqrt(dx*dx + dy*dy + dz*dz);
+                        if (dist <= (double)pr->sensor_range_ly) {
+                            if (np_count > 0) resp[p++] = ',';
+                            p += snprintf(resp + p, REM,
+                                "{\"probe_id\":\"%llu-%llu\","
+                                "\"name\":\"%s\","
+                                "\"status\":\"%s\","
+                                "\"distance_ly\":%.3f}",
+                                (unsigned long long)uni.probes[j].id.hi,
+                                (unsigned long long)uni.probes[j].id.lo,
+                                uni.probes[j].name,
+                                PIPE_STATUS_NAMES[uni.probes[j].status],
+                                dist);
+                            np_count++;
+                        }
+                    }
+                }
+                p += snprintf(resp + p, REM, "],");
+
+                /* Inbox — delivered messages for this probe */
+                p += snprintf(resp + p, REM, "\"inbox\":[");
+                {
+                    message_t msgs[16];
+                    int nm = comm_get_inbox(&g_pipe_comm, pr->id, msgs, 16);
+                    for (int m = 0; m < nm; m++) {
+                        if (m > 0) resp[p++] = ',';
+                        /* Escape content */
+                        char safe[MAX_MSG_CONTENT + 64];
+                        int si = 0;
+                        for (int c = 0; msgs[m].content[c] && si < (int)sizeof(safe) - 2; c++) {
+                            char ch = msgs[m].content[c];
+                            if (ch == '"' || ch == '\\') safe[si++] = '\\';
+                            safe[si++] = ch;
+                        }
+                        safe[si] = '\0';
+                        p += snprintf(resp + p, REM,
+                            "{\"from\":\"%llu-%llu\","
+                            "\"content\":\"%s\","
+                            "\"sent_tick\":%llu}",
+                            (unsigned long long)msgs[m].sender_id.hi,
+                            (unsigned long long)msgs[m].sender_id.lo,
+                            safe,
+                            (unsigned long long)msgs[m].sent_tick);
+                    }
+                }
+                p += snprintf(resp + p, REM, "],");
+
+                /* Visible beacons in current system */
+                p += snprintf(resp + p, REM, "\"visible_beacons\":[");
+                {
+                    beacon_t beacons[16];
+                    int nb = comm_detect_beacons(&g_pipe_comm, pr->system_id,
+                                                  beacons, 16);
+                    for (int b = 0; b < nb; b++) {
+                        if (b > 0) resp[p++] = ',';
+                        char safe[MAX_BEACON_MSG + 64];
+                        int si = 0;
+                        for (int c = 0; beacons[b].message[c] && si < (int)sizeof(safe) - 2; c++) {
+                            char ch = beacons[b].message[c];
+                            if (ch == '"' || ch == '\\') safe[si++] = '\\';
+                            safe[si++] = ch;
+                        }
+                        safe[si] = '\0';
+                        p += snprintf(resp + p, REM,
+                            "{\"owner\":\"%llu-%llu\","
+                            "\"message\":\"%s\","
+                            "\"placed_tick\":%llu}",
+                            (unsigned long long)beacons[b].owner_id.hi,
+                            (unsigned long long)beacons[b].owner_id.lo,
+                            safe,
+                            (unsigned long long)beacons[b].placed_tick);
+                    }
+                }
+                p += snprintf(resp + p, REM, "],");
+
+                /* Visible structures in current system */
+                p += snprintf(resp + p, REM, "\"visible_structures\":[");
+                {
+                    int vs_count = 0;
+                    for (int s = 0; s < g_pipe_society.structure_count; s++) {
+                        const structure_t *st = &g_pipe_society.structures[s];
+                        if (!uid_eq(st->system_id, pr->system_id)) continue;
+                        if (vs_count > 0) resp[p++] = ',';
+                        const structure_spec_t *spec = structure_get_spec(st->type);
+                        p += snprintf(resp + p, REM,
+                            "{\"type\":%d,\"name\":\"%s\","
+                            "\"complete\":%s,"
+                            "\"progress\":%.3f,"
+                            "\"builder\":\"%llu-%llu\"}",
+                            (int)st->type,
+                            spec ? spec->name : "unknown",
+                            st->complete ? "true" : "false",
+                            st->build_ticks_total > 0
+                              ? (double)st->build_ticks_elapsed / st->build_ticks_total
+                              : 0.0,
+                            (unsigned long long)st->builder_ids[0].hi,
+                            (unsigned long long)st->builder_ids[0].lo);
+                        vs_count++;
+                    }
+                }
+                p += snprintf(resp + p, REM, "],");
+
+                /* Pending trades for this probe */
+                p += snprintf(resp + p, REM, "\"pending_trades\":[");
+                {
+                    int tc = 0;
+                    for (int t = 0; t < g_pipe_society.trade_count; t++) {
+                        const trade_t *tr = &g_pipe_society.trades[t];
+                        if (tr->status != TRADE_IN_TRANSIT
+                            && tr->status != TRADE_PENDING) continue;
+                        if (!uid_eq(tr->receiver_id, pr->id)
+                            && !uid_eq(tr->sender_id, pr->id)) continue;
+                        if (tc > 0) resp[p++] = ',';
+                        p += snprintf(resp + p, REM,
+                            "{\"from\":\"%llu-%llu\","
+                            "\"to\":\"%llu-%llu\","
+                            "\"resource\":\"%s\","
+                            "\"amount\":%.1f,"
+                            "\"status\":%d}",
+                            (unsigned long long)tr->sender_id.hi,
+                            (unsigned long long)tr->sender_id.lo,
+                            (unsigned long long)tr->receiver_id.hi,
+                            (unsigned long long)tr->receiver_id.lo,
+                            resource_to_name(tr->resource),
+                            tr->amount,
+                            (int)tr->status);
+                        tc++;
+                    }
+                }
+                p += snprintf(resp + p, REM, "]}");
             }
-            p += snprintf(resp + p, sizeof(resp) - (size_t)p, "]}");
+            p += snprintf(resp + p, REM, "]}");
+            #undef REM
             fprintf(stdout, "%s\n", resp);
             fflush(stdout);
             continue;
@@ -523,6 +973,187 @@ static int run_pipe_mode(uint64_t seed) {
             data += 7;
             int n = config_parse_json(&g_pipe_cfg, data);
             fprintf(stdout, "{\"ok\":true,\"entries\":%d}\n", n);
+            fflush(stdout);
+            continue;
+        }
+
+        /* ---- save ---- */
+        if (strcmp(cmd, "save") == 0) {
+            char path[256] = {0};
+            const char *pp = strstr(line, "\"path\":\"");
+            if (!pp) { pipe_err("missing path"); continue; }
+            pp += 8;
+            int pi = 0;
+            while (*pp && *pp != '"' && pi < 255) path[pi++] = *pp++;
+            path[pi] = '\0';
+
+            persist_t db;
+            if (persist_open(&db, path) != 0) {
+                pipe_err("db open failed"); continue;
+            }
+            persist_save_meta(&db, &uni);
+            for (uint32_t i = 0; i < uni.probe_count; i++) {
+                persist_save_probe(&db, &uni.probes[i]);
+            }
+            persist_close(&db);
+            fprintf(stdout,
+                "{\"ok\":true,\"saved\":\"%s\",\"tick\":%llu,\"probes\":%u}\n",
+                path, (unsigned long long)uni.tick, uni.probe_count);
+            fflush(stdout);
+            continue;
+        }
+
+        /* ---- load ---- */
+        if (strcmp(cmd, "load") == 0) {
+            char path[256] = {0};
+            const char *pp = strstr(line, "\"path\":\"");
+            if (!pp) { pipe_err("missing path"); continue; }
+            pp += 8;
+            int pi = 0;
+            while (*pp && *pp != '"' && pi < 255) path[pi++] = *pp++;
+            path[pi] = '\0';
+
+            persist_t db;
+            if (persist_open(&db, path) != 0) {
+                pipe_err("db open failed"); continue;
+            }
+            if (persist_load_meta(&db, &uni) != 0) {
+                persist_close(&db);
+                pipe_err("no meta in db"); continue;
+            }
+            /* Load probes — query all from probes table */
+            uni.probe_count = 0;
+            sqlite3_stmt *stmt;
+            if (sqlite3_prepare_v2(db.db,
+                "SELECT id FROM probes ORDER BY generation, id", -1,
+                &stmt, NULL) == SQLITE_OK) {
+                while (sqlite3_step(stmt) == SQLITE_ROW && uni.probe_count < MAX_PROBES) {
+                    const char *id_hex = (const char *)sqlite3_column_text(stmt, 0);
+                    if (id_hex) {
+                        probe_uid_t uid = {0, 0};
+                        if (strlen(id_hex) == 32) {
+                            char hi_s[17] = {0}, lo_s[17] = {0};
+                            memcpy(hi_s, id_hex, 16);
+                            memcpy(lo_s, id_hex + 16, 16);
+                            uid.hi = strtoull(hi_s, NULL, 16);
+                            uid.lo = strtoull(lo_s, NULL, 16);
+                        }
+                        if (persist_load_probe(&db, uid,
+                            &uni.probes[uni.probe_count]) == 0) {
+                            uni.probe_count++;
+                        }
+                    }
+                }
+                sqlite3_finalize(stmt);
+            }
+            persist_close(&db);
+            /* Re-seed RNG to match loaded tick */
+            rng_seed(&rng, uni.seed);
+            for (uint64_t t = 0; t < uni.tick; t++) rng_next(&rng);
+            /* Reset replication/comm/society state */
+            memset(g_pipe_repl, 0, sizeof(g_pipe_repl));
+            comm_init(&g_pipe_comm);
+            society_init(&g_pipe_society);
+            fprintf(stdout,
+                "{\"ok\":true,\"loaded\":\"%s\",\"tick\":%llu,\"probes\":%u}\n",
+                path, (unsigned long long)uni.tick, uni.probe_count);
+            fflush(stdout);
+            continue;
+        }
+
+        /* ---- scan ---- */
+        if (strcmp(cmd, "scan") == 0) {
+            /* Parse probe_id from: {"cmd":"scan","probe_id":"1-1"} */
+            char pid_str[64] = {0};
+            const char *pp = strstr(line, "\"probe_id\":\"");
+            if (!pp) { pipe_err("missing probe_id"); continue; }
+            pp += 12;
+            int pi = 0;
+            while (*pp && *pp != '"' && pi < 63) pid_str[pi++] = *pp++;
+            pid_str[pi] = '\0';
+
+            probe_uid_t uid = parse_uid_str(pid_str);
+            int idx = find_probe_idx(&uni, uid);
+            if (idx < 0) { pipe_err("probe not found"); continue; }
+
+            probe_t *pr = &uni.probes[idx];
+
+            /* Generate systems from nearby sectors (3x3x3 cube) */
+            system_t nearby[30 * 27]; /* up to 27 sectors × 30 systems */
+            int nearby_count = 0;
+            sector_coord_t base = pr->sector;
+            for (int dx = -1; dx <= 1; dx++) {
+                for (int dy = -1; dy <= 1; dy++) {
+                    for (int dz = -1; dz <= 1; dz++) {
+                        sector_coord_t sc = {
+                            base.x + dx, base.y + dy, base.z + dz
+                        };
+                        int n = generate_sector(
+                            &nearby[nearby_count], 30, seed, sc);
+                        nearby_count += n;
+                        if (nearby_count > 30 * 27 - 30) break;
+                    }
+                    if (nearby_count > 30 * 27 - 30) break;
+                }
+                if (nearby_count > 30 * 27 - 30) break;
+            }
+
+            /* Run travel_scan */
+            scan_result_t results[64];
+            int found = travel_scan(pr, nearby, nearby_count,
+                                    results, 64);
+
+            /* Build response — include system names and positions */
+            int p = 0;
+            size_t rem2;
+            #define REM2 (rem2 = sizeof(resp) - (size_t)p, rem2)
+            p += snprintf(resp + p, REM2,
+                "{\"ok\":true,\"probe_id\":\"%s\",\"systems\":[",
+                pid_str);
+            for (int s = 0; s < found; s++) {
+                if (s > 0) resp[p++] = ',';
+                /* Find the system name and position from nearby array */
+                const char *sname = "unknown";
+                vec3_t spos = {0, 0, 0};
+                sector_coord_t ssec = {0, 0, 0};
+                int star_count = 0;
+                star_class_t sclass = results[s].star_class;
+                for (int j = 0; j < nearby_count; j++) {
+                    if (uid_eq(nearby[j].id, results[s].system_id)) {
+                        sname = nearby[j].name;
+                        spos = nearby[j].position;
+                        ssec = nearby[j].sector;
+                        star_count = nearby[j].star_count;
+                        sclass = nearby[j].stars[0].class;
+                        /* Cache the system for future use */
+                        if (g_pipe_sys_count < SYS_CACHE_MAX) {
+                            g_pipe_sys_cache[g_pipe_sys_count++] = nearby[j];
+                        }
+                        break;
+                    }
+                }
+                double est_ticks = results[s].distance_ly
+                    / (double)pr->max_speed_c * TICKS_PER_CYCLE;
+                p += snprintf(resp + p, REM2,
+                    "{\"system_id\":\"%llu-%llu\","
+                    "\"name\":\"%s\","
+                    "\"star_class\":%d,"
+                    "\"star_count\":%d,"
+                    "\"distance_ly\":%.3f,"
+                    "\"estimated_travel_ticks\":%llu,"
+                    "\"position\":[%.3f,%.3f,%.3f],"
+                    "\"sector\":[%d,%d,%d]}",
+                    (unsigned long long)results[s].system_id.hi,
+                    (unsigned long long)results[s].system_id.lo,
+                    sname, (int)sclass, star_count,
+                    results[s].distance_ly,
+                    (unsigned long long)est_ticks,
+                    spos.x, spos.y, spos.z,
+                    ssec.x, ssec.y, ssec.z);
+            }
+            p += snprintf(resp + p, REM2, "]}");
+            #undef REM2
+            fprintf(stdout, "%s\n", resp);
             fflush(stdout);
             continue;
         }

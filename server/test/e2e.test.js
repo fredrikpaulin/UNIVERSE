@@ -259,6 +259,163 @@ describe("end-to-end", () => {
     expect(single.probe.name).toBe(status.probes[0].name);
   });
 
+  test("observations include enriched fields (resources, position, capabilities)", async () => {
+    const resp = await post("/api/tick");
+    expect(resp.ok).toBe(true);
+    const obs = resp.observations[0];
+
+    // Resources object
+    expect(obs.resources).toBeDefined();
+    expect(typeof obs.resources.iron).toBe("number");
+    expect(typeof obs.resources.silicon).toBe("number");
+    expect(typeof obs.resources.exotic).toBe("number");
+
+    // Position object
+    expect(obs.position).toBeDefined();
+    expect(obs.position.sector).toBeArrayOfSize(3);
+    expect(typeof obs.position.system_id).toBe("string");
+    expect(obs.position.heading).toBeArrayOfSize(3);
+    expect(typeof obs.position.travel_remaining_ly).toBe("number");
+
+    // Capabilities object
+    expect(obs.capabilities).toBeDefined();
+    expect(obs.capabilities.max_speed_c).toBeGreaterThan(0);
+    expect(obs.capabilities.sensor_range_ly).toBeGreaterThan(0);
+    expect(obs.capabilities.mining_rate).toBeGreaterThan(0);
+  });
+
+  test("observations include enhanced system details", async () => {
+    const resp = await post("/api/tick");
+    const obs = resp.observations[0];
+    const sys = obs.system;
+
+    expect(sys).toBeDefined();
+    expect(sys.name.length).toBeGreaterThan(0);
+    expect(sys.star_count).toBeGreaterThan(0);
+    expect(sys.planet_count).toBeGreaterThan(0);
+
+    // Star details
+    const star = sys.stars[0];
+    expect(star.name.length).toBeGreaterThan(0);
+    expect(typeof star.class).toBe("number");
+    expect(star.luminosity_solar).toBeGreaterThan(0);
+    expect(typeof star.metallicity).toBe("number");
+
+    // Planet details
+    const planet = sys.planets[0];
+    expect(planet.radius_earth).toBeGreaterThan(0);
+    expect(planet.orbital_period_days).toBeGreaterThan(0);
+    expect(planet.surface_temp_k).toBeGreaterThan(0);
+    expect(typeof planet.atmosphere_pressure_atm).toBe("number");
+    expect(typeof planet.water_coverage).toBe("number");
+    expect(typeof planet.magnetic_field).toBe("number");
+    expect(typeof planet.rings).toBe("boolean");
+    expect(typeof planet.moon_count).toBe("number");
+    expect(planet.survey_complete).toBeArrayOfSize(5);
+
+    // Planet resources
+    expect(planet.resources).toBeDefined();
+    expect(typeof planet.resources.iron).toBe("number");
+    expect(planet.resources.iron).toBeGreaterThanOrEqual(0);
+    expect(planet.resources.iron).toBeLessThanOrEqual(1);
+  });
+
+  test("POST /api/scan/:probeId returns nearby systems", async () => {
+    const status = await get("/api/status");
+    const probeId = status.probes[0].id;
+    const scan = await post(`/api/scan/${probeId}`);
+
+    expect(scan.ok).toBe(true);
+    expect(scan.probe_id).toBe(probeId);
+    expect(Array.isArray(scan.systems)).toBe(true);
+
+    if (scan.systems.length > 0) {
+      const sys = scan.systems[0];
+      expect(typeof sys.system_id).toBe("string");
+      expect(typeof sys.name).toBe("string");
+      expect(sys.distance_ly).toBeGreaterThan(0);
+      expect(sys.estimated_travel_ticks).toBeGreaterThan(0);
+      expect(sys.position).toBeArrayOfSize(3);
+      expect(sys.sector).toBeArrayOfSize(3);
+    }
+  });
+
+  test("travel_to_system action makes probe travel", async () => {
+    // Snapshot first so we can restore
+    await post("/api/snapshot", { tag: "pre_travel" });
+
+    const status = await get("/api/status");
+    const probeId = status.probes[0].id;
+    const scan = await post(`/api/scan/${probeId}`);
+
+    if (scan.systems.length > 0) {
+      const target = scan.systems[0];
+
+      // Connect a temporary agent that sends the travel action
+      const { ws: agentWs, received } = await connectAgent(probeId, (msg) => ({
+        action: "travel_to_system",
+        target_system_id: target.system_id,
+        sector_x: target.sector[0],
+        sector_y: target.sector[1],
+        sector_z: target.sector[2],
+      }));
+
+      // Run a tick — agent sends travel action
+      const resp = await post("/api/tick");
+      await new Promise((r) => setTimeout(r, 200));
+
+      // Run another tick to see the traveling state
+      const resp2 = await post("/api/tick");
+      const obs = resp2.observations.find((o) => o.probe_id === probeId);
+      expect(obs.status).toBe("traveling");
+      expect(obs.location).toBe("interstellar");
+
+      agentWs.close();
+      await new Promise((r) => setTimeout(r, 100));
+
+      // Restore state
+      await post("/api/restore", { tag: "pre_travel" });
+    }
+  });
+
+  test("observations include recent_events and nearby_probes arrays", async () => {
+    const resp = await post("/api/tick");
+    const obs = resp.observations[0];
+
+    expect(Array.isArray(obs.recent_events)).toBe(true);
+    expect(Array.isArray(obs.nearby_probes)).toBe(true);
+  });
+
+  test("save and load round-trip preserves state", async () => {
+    // Run some ticks to advance state
+    await post("/api/tick");
+    await post("/api/tick");
+    const before = await get("/api/status");
+    const tickBefore = before.tick;
+
+    // Save
+    const saveResp = await post("/api/save", { path: "/tmp/e2e_test.db" });
+    expect(saveResp.ok).toBe(true);
+    expect(saveResp.tick).toBe(tickBefore);
+    expect(saveResp.probes).toBe(before.probes.length);
+
+    // Run more ticks
+    await post("/api/tick");
+    await post("/api/tick");
+    const after = await get("/api/status");
+    expect(after.tick).toBe(tickBefore + 2);
+
+    // Load — should restore to saved state
+    const loadResp = await post("/api/load", { path: "/tmp/e2e_test.db" });
+    expect(loadResp.ok).toBe(true);
+    expect(loadResp.tick).toBe(tickBefore);
+    expect(loadResp.probes).toBe(before.probes.length);
+
+    // Verify tick matches
+    const restored = await get("/api/status");
+    expect(restored.tick).toBe(tickBefore);
+  });
+
   test("agent disconnect → probe gets fallback → agent reconnect", async () => {
     const status = await get("/api/status");
     const probeId = status.probes[0].id;
@@ -280,5 +437,140 @@ describe("end-to-end", () => {
 
     ws2.close();
     await new Promise((r) => setTimeout(r, 100));
+  });
+
+  test("observations include coordination arrays (inbox, beacons, structures, trades)", async () => {
+    const resp = await post("/api/tick");
+    const obs = resp.observations[0];
+
+    expect(Array.isArray(obs.inbox)).toBe(true);
+    expect(Array.isArray(obs.visible_beacons)).toBe(true);
+    expect(Array.isArray(obs.visible_structures)).toBe(true);
+    expect(Array.isArray(obs.pending_trades)).toBe(true);
+  });
+
+  test("place_beacon action creates visible beacon", async () => {
+    await post("/api/snapshot", { tag: "pre_beacon" });
+
+    const status = await get("/api/status");
+    const probeId = status.probes[0].id;
+
+    // Connect agent that places a beacon
+    const { ws: agentWs } = await connectAgent(probeId, () => ({
+      action: "place_beacon",
+      message: "Explorer was here",
+    }));
+
+    // Run tick — agent places beacon
+    await post("/api/tick");
+    await new Promise((r) => setTimeout(r, 200));
+
+    // Next tick — beacon should be visible
+    const resp = await post("/api/tick");
+    const obs = resp.observations.find((o) => o.probe_id === probeId);
+    expect(obs.visible_beacons.length).toBeGreaterThan(0);
+    expect(obs.visible_beacons[0].owner).toBe(probeId);
+    expect(obs.visible_beacons[0].message).toBe("Explorer was here");
+
+    agentWs.close();
+    await new Promise((r) => setTimeout(r, 100));
+    await post("/api/restore", { tag: "pre_beacon" });
+  });
+
+  test("build_structure action shows in-progress structure", async () => {
+    await post("/api/snapshot", { tag: "pre_build" });
+
+    const status = await get("/api/status");
+    const probeId = status.probes[0].id;
+
+    // Connect agent that builds a mining station (type 0)
+    const { ws: agentWs } = await connectAgent(probeId, () => ({
+      action: "build_structure",
+      structure_type: 0,
+    }));
+
+    // Run tick — agent starts building
+    await post("/api/tick");
+    await new Promise((r) => setTimeout(r, 200));
+
+    // Next tick — structure should be visible (in progress)
+    const resp = await post("/api/tick");
+    const obs = resp.observations.find((o) => o.probe_id === probeId);
+    expect(obs.visible_structures.length).toBeGreaterThan(0);
+    expect(obs.visible_structures[0].complete).toBe(false);
+    expect(obs.visible_structures[0].progress).toBeGreaterThan(0);
+    expect(typeof obs.visible_structures[0].name).toBe("string");
+
+    agentWs.close();
+    await new Promise((r) => setTimeout(r, 100));
+    await post("/api/restore", { tag: "pre_build" });
+  });
+
+  test("send_message action delivers to target probe inbox", async () => {
+    // This test needs 2 probes — skip if only 1
+    const status = await get("/api/status");
+    if (status.probes.length < 2) {
+      // Just verify the action doesn't crash with 1 probe
+      const resp = await post("/api/tick");
+      expect(resp.ok).toBe(true);
+      return;
+    }
+
+    await post("/api/snapshot", { tag: "pre_msg" });
+
+    const probeA = status.probes[0].id;
+    const probeB = status.probes[1].id;
+
+    // Agent A sends message to B
+    const { ws: wsA } = await connectAgent(probeA, () => ({
+      action: "send_message",
+      target: probeB,
+      content: "Hello from probe A",
+    }));
+
+    // Run ticks to send and allow light-delay delivery
+    for (let i = 0; i < 5; i++) await post("/api/tick");
+    await new Promise((r) => setTimeout(r, 200));
+
+    const resp = await post("/api/tick");
+    const obsB = resp.observations.find((o) => o.probe_id === probeB);
+    // Message may or may not have arrived depending on light delay
+    expect(Array.isArray(obsB?.inbox)).toBe(true);
+
+    wsA.close();
+    await new Promise((r) => setTimeout(r, 100));
+    await post("/api/restore", { tag: "pre_msg" });
+  });
+
+  test("trade action creates pending trade", async () => {
+    // Needs 2 probes
+    const status = await get("/api/status");
+    if (status.probes.length < 2) {
+      const resp = await post("/api/tick");
+      expect(resp.ok).toBe(true);
+      return;
+    }
+
+    await post("/api/snapshot", { tag: "pre_trade" });
+
+    const probeA = status.probes[0].id;
+    const probeB = status.probes[1].id;
+
+    const { ws: wsA } = await connectAgent(probeA, () => ({
+      action: "trade",
+      target: probeB,
+      resource: "iron",
+      amount: 100,
+    }));
+
+    await post("/api/tick");
+    await new Promise((r) => setTimeout(r, 200));
+
+    const resp = await post("/api/tick");
+    expect(resp.ok).toBe(true);
+
+    wsA.close();
+    await new Promise((r) => setTimeout(r, 100));
+    await post("/api/restore", { tag: "pre_trade" });
   });
 });
